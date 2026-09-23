@@ -171,6 +171,21 @@ const STACK_NOTE =
   "include the right marker file, and use that ecosystem's idiomatic test file location/framework " +
   "exactly as described above, or CI will have nothing to run.";
 
+// Real, measured constraint (not an arbitrary guess): a single milestone build - drafting code
+// and tests via DeepSeek, then committing - has to finish inside one serverless function call,
+// which is hard-capped at a few minutes on the current hosting plan. Milestones with a dozen-plus
+// files have repeatedly blown past that ceiling. Keep milestones small enough to comfortably fit;
+// bump this only after the hosting plan's own duration limit is raised.
+const MAX_FILES_PER_MILESTONE = 4;
+const MAX_ARTIFACTS_PER_MILESTONE = MAX_FILES_PER_MILESTONE * 2; // + roughly one test file each
+
+const MILESTONE_SIZE_NOTE =
+  `Each milestone must be small enough to draft and commit inside one short automated build cycle: ` +
+  `at most ${MAX_FILES_PER_MILESTONE} source/target files (plus their tests). If a genuinely useful slice would ` +
+  "need more than that, split it into two or more smaller milestones instead of cramming it into one - " +
+  "many small milestones are strongly preferred over a few large ones. Keep any sample/fixture data " +
+  "minimal (a handful of representative rows/fields), never an exhaustive dataset.";
+
 type Intent = "chat" | "issue" | "pr";
 
 async function classifyIntent(message: string): Promise<Intent> {
@@ -443,11 +458,14 @@ async function draftRoadmap(message: string, fileList: string[]): Promise<{ road
         content:
           "A developer asked a GitHub agent for a code change. Before writing any code, break the request into " +
           "an ordered list of milestones - each one a genuinely useful, shippable slice that builds on the ones " +
-          "before it (not an arbitrary file split). Reply with ONLY a json object shaped like " +
-          '{"summary": "one paragraph overview of the whole plan", "milestones": [{"name": "short milestone ' +
-          'name", "goal": "what this milestone delivers and why it comes at this point"}]}. Most requests need ' +
-          "2-5 milestones; use your judgement, never pad the list. Do NOT write code - this is a roadmap for a " +
-          `human to approve or push back on. ${TELEGRAM_FORMATTING_NOTE}\n\n` +
+          "before it (not an arbitrary file split). " +
+          `${MILESTONE_SIZE_NOTE} It is normal and expected for a real feature to need many milestones (8-15+, ` +
+          "sometimes more) rather than a handful of large ones - err toward more, smaller milestones. Reply with " +
+          'ONLY a json object shaped like {"summary": "one paragraph overview of the whole plan", "milestones": ' +
+          '[{"name": "short milestone name", "goal": "what this milestone delivers and why it comes at this ' +
+          'point"}]}. Never pad the list with busywork, but never merge more work into one milestone than the ' +
+          `size limit above allows. Do NOT write code - this is a roadmap for a human to approve or push back ` +
+          `on. ${TELEGRAM_FORMATTING_NOTE}\n\n` +
           `Repository files:\n${fileList.join("\n") || "(repository has no files yet)"}`,
       },
       { role: "user", content: message },
@@ -491,8 +509,9 @@ async function reviseRoadmap(
           currentRoadmapText +
           "\n\nfor this original request:\n\n" +
           originalMessage +
-          "\n\nA senior engineer gave feedback on it. Revise the roadmap to address the feedback. Reply with " +
-          'ONLY a json object shaped like {"summary": "one paragraph overview", "milestones": [{"name": "...", ' +
+          "\n\nA senior engineer gave feedback on it. Revise the roadmap to address the feedback. " +
+          `${MILESTONE_SIZE_NOTE} Reply with ONLY a json object shaped like {"summary": "one paragraph ` +
+          'overview", "milestones": [{"name": "...", ' +
           `"goal": "..."}]} - the full revised roadmap, not a diff of changes. ${TELEGRAM_FORMATTING_NOTE}`,
       },
       { role: "user", content: feedback },
@@ -580,7 +599,7 @@ async function draftMilestonePlan(
           `You are now planning just ONE milestone of it: "${milestone.name}" — ${milestone.goal}\n\n` +
           "Propose a short engineering plan for this milestone only (files/approach, key decisions, edge cases) " +
           "for a senior engineer to review before you write code. Do NOT write code or a diff, and do not " +
-          `redo work from earlier milestones. ${STACK_NOTE} ${TELEGRAM_FORMATTING_NOTE}\n\n` +
+          `redo work from earlier milestones. ${STACK_NOTE} ${MILESTONE_SIZE_NOTE} ${TELEGRAM_FORMATTING_NOTE}\n\n` +
           (logText ? `Work already completed in earlier milestones:\n${logText}\n\n` : "") +
           `Repository files so far:\n${fileList.join("\n") || "(no files yet)"}`,
       },
@@ -611,11 +630,6 @@ async function revisePlan(originalMessage: string, currentPlan: string, feedback
   return completion.choices[0]?.message?.content ?? currentPlan;
 }
 
-// This is a sanity ceiling, not a scope-control mechanism - scope is now controlled by the
-// milestone boundary itself (each milestone gets its own approval), not an arbitrary file count.
-// This just catches DeepSeek producing a pathological, clearly-malformed response.
-const MAX_FILES_SANITY_CEILING = 30;
-
 type MilestoneFilePlan = { canFulfill: true; paths: string[] } | { canFulfill: false; reason: string };
 
 async function planMilestoneFiles(milestone: Milestone, milestonePlanText: string, fileList: string[]): Promise<MilestoneFilePlan> {
@@ -631,7 +645,8 @@ async function planMilestoneFiles(milestone: Milestone, milestonePlanText: strin
           'if it can be done, {"canFulfill": true, "paths": ["relative/file/path.ext", ...]} — reuse existing ' +
           "paths from the list when updating files, sensible new relative paths when creating them. If it " +
           'genuinely cannot be done, reply {"canFulfill": false, "reason": "short explanation for the developer"}. ' +
-          `The "reason" field is the only part of this response a person ever reads. ${TELEGRAM_FORMATTING_NOTE}\n\n` +
+          `The "reason" field is the only part of this response a person ever reads. ${MILESTONE_SIZE_NOTE} ` +
+          `${TELEGRAM_FORMATTING_NOTE}\n\n` +
           `Milestone plan:\n${milestonePlanText}\n\n` +
           `Repository files:\n${fileList.join("\n") || "(repository has no files yet)"}`,
       },
@@ -645,14 +660,18 @@ async function planMilestoneFiles(milestone: Milestone, milestonePlanText: strin
 
   try {
     const parsed = JSON.parse(raw);
-    if (
-      parsed.canFulfill === true &&
-      Array.isArray(parsed.paths) &&
-      parsed.paths.length > 0 &&
-      parsed.paths.length <= MAX_FILES_SANITY_CEILING &&
-      parsed.paths.every((p: unknown) => typeof p === "string" && isSafeRepoPath(p))
-    ) {
-      return { canFulfill: true, paths: parsed.paths };
+    if (parsed.canFulfill === true && Array.isArray(parsed.paths) && parsed.paths.length > 0) {
+      if (parsed.paths.length > MAX_FILES_PER_MILESTONE) {
+        return {
+          canFulfill: false,
+          reason:
+            `This milestone would touch ${parsed.paths.length} files, more than fits in one build cycle ` +
+            `(max ${MAX_FILES_PER_MILESTONE}). Reply with feedback to split it into smaller milestones.`,
+        };
+      }
+      if (parsed.paths.every((p: unknown) => typeof p === "string" && isSafeRepoPath(p))) {
+        return { canFulfill: true, paths: parsed.paths };
+      }
     }
     if (parsed.canFulfill === false && typeof parsed.reason === "string") {
       return { canFulfill: false, reason: parsed.reason };
@@ -722,7 +741,9 @@ async function draftCodeAndTests(
           '"short commit message", "prTitle": "short PR title", "prBody": "PR description"}. Every "content" ' +
           "must be the COMPLETE content of that file, not a diff. Every path in \"files\" must be exactly one " +
           `of these target files: ${paths.join(", ")}. Include at least one test file covering the change's ` +
-          `testable logic, using that ecosystem's idiomatic test location and framework. ${STACK_NOTE}\n\n` +
+          "testable logic, using that ecosystem's idiomatic test location and framework. Keep any generated " +
+          "sample/fixture content minimal (a handful of representative rows/fields), never an exhaustive " +
+          `dataset - this has to generate quickly. ${STACK_NOTE}\n\n` +
           `Approved milestone plan:\n${planText}\n\n` +
           `Target files:\n${paths.join("\n")}\n\n` +
           `Repository files:\n${fileList.join("\n") || "(repository has no files yet)"}\n\n` +
@@ -745,7 +766,7 @@ async function draftCodeAndTests(
     if (
       isFileChangeArray(parsed.files) &&
       isFileChangeArray(parsed.tests) &&
-      parsed.files.length + parsed.tests.length <= MAX_FILES_SANITY_CEILING &&
+      parsed.files.length + parsed.tests.length <= MAX_ARTIFACTS_PER_MILESTONE &&
       typeof parsed.commitMessage === "string" &&
       typeof parsed.prTitle === "string" &&
       typeof parsed.prBody === "string"
