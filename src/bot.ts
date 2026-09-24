@@ -1577,10 +1577,20 @@ bot.on("text", async (ctx) => {
 
   const chunks = splitForTelegram(resultText);
 
+  // Operational messages (PR/issue links, repo names) contain underscores that Telegram's Markdown
+  // silently mangles - "Target_Repo_For_AgentOps" becomes italicised and the link breaks. Telegram
+  // auto-links bare URLs anyway, so send anything containing a URL as plain text; only the
+  // conversational/DeepSeek replies (which use *bold*/_italic_ intentionally) go through Markdown.
+  const useMarkdown = (text: string): boolean => !/https?:\/\//.test(text);
+
   try {
-    await ctx.telegram.editMessageText(ctx.chat.id, placeholder.message_id, undefined, chunks[0], {
-      parse_mode: "Markdown",
-    });
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      placeholder.message_id,
+      undefined,
+      chunks[0],
+      useMarkdown(chunks[0]) ? { parse_mode: "Markdown" } : {}
+    );
   } catch (err) {
     console.error("Formatted reply failed, falling back to plain text:", err);
     try {
@@ -1594,7 +1604,7 @@ bot.on("text", async (ctx) => {
 
   for (const chunk of chunks.slice(1)) {
     try {
-      await ctx.reply(chunk, { parse_mode: "Markdown" });
+      await ctx.reply(chunk, useMarkdown(chunk) ? { parse_mode: "Markdown" } : {});
     } catch (err) {
       console.error("Formatted follow-up failed, falling back to plain text:", err);
       try {
