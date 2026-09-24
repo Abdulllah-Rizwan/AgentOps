@@ -421,3 +421,65 @@ Pick from these tomorrow, in roughly this order:
 6. **If milestones still occasionally run long even at the 4-file cap**, the next lever is lowering `MAX_FILES_PER_MILESTONE` further, or looking specifically at DeepSeek's own response latency rather than file count.
 7. **Longer-term, still deferred:** a Vercel Pro upgrade (raises the function duration ceiling to 800s, a small/boring fix) or a true background-job architecture (queue-based, no per-request time ceiling at all) — revisit only if the client wants more ambitious builds than the tiny-milestone flow comfortably supports. Do not build either speculatively.
 8. Only after all of the above are solid: write the client-facing v2 setup steps, derived from what actually worked — per CLAUDE.md's "prove on throwaway infra first."
+
+---
+
+## Session 2026-09-24 — Milestone-3 failure diagnosis, per-file drafting fix, and the strategic pivot to a reliable single-PR product
+
+### Diagnosed the milestone-3 failures — root cause was reasoning-token burn, NOT memory/DB/context
+
+The deployed bot kept failing at milestone 3 (both on the PSX roadmap and a fresh 16-milestone todo project) with *"couldn't turn this milestone's plan into code and tests"* / *"DeepSeek returned an empty response"*, and follow-up questions got *"I don't have memory of other chats"*. Replayed milestone 3's exact `draftCodeAndTests` call against DeepSeek to ground the diagnosis instead of guessing:
+
+- **Input context was tiny** (~2.6k prompt tokens at milestone 3) — the "it fills up capacity" hypothesis is disproven; the 128k window is nowhere near full, and the pipeline state was intact and retry-safe every time. **Not** a DB/persistence problem.
+- **`deepseek-v4-flash` is a reasoning model** whose hidden reasoning burn on a logic-heavy milestone is large and highly variable — measured **13k–29k reasoning tokens on byte-identical input**, with **~60% of runs (3 of 5) producing invalid/empty output**. The single bundled call (all files + all tests + PR metadata in one JSON) was fragile: any malformed field discarded the whole milestone.
+- **The two failure points logged nothing** (empty/unparseable completion is a normal HTTP 200, not a thrown error), which is exactly why the logs never explained it.
+- The *"I don't have memory"* replies are **not a bug** — a follow-up question falls through to the stateless chat handler, which correctly says it has no history. Pipeline state was fine.
+
+### Fix — instrument + split the bundled draft into per-file calls (committed `9df645d`)
+
+- **Instrumentation:** `logCompletion` / `logCompletionReject` log `finish_reason`, completion/reasoning tokens, and the specific reject reason at every drafting failure point.
+- **Per-file drafting:** `draftCodeAndTests` now drafts **one file per call** — source files in parallel, then test files in parallel *grounded in the just-drafted source* (so tests match the real API). The per-file `{content}` schema is far harder to malform. Metadata (`commitMessage`/`prBody`) is now **derived from the approved plan**; the never-read `prTitle` field dropped. `planMilestoneFiles` now always requests test path(s); CI-failure revision re-drafts source + test together.
+- **Content-level retries:** `draftOneFile` retries up to 3× on empty/unparseable output (separate from the SDK's network retries).
+- Verified by replaying milestone 3 through the new logic: **6/6 valid** vs 2/5 before.
+
+### Live test on the deployed bot: the fix worked, then surfaced two real things
+
+Milestone 3 **built, committed (one clean commit), and triggered CI for the first time under the new code**. But:
+
+1. **CI genuinely FAILED — and correctly so.** The drafted `store.ts` stored the id/timestamp **generator functions** instead of calling them (`id: newId` vs `newId()`), and chat isolation was broken (`not ok 29/30`, `ERR_ASSERTION`). The pipeline caught a real bug — working as designed. The "one failed followed by two passing" the developer saw on GitHub was a **misread**: GitHub lists runs newest-first, so it was milestone 3 (failed, newest) above the older milestone 1 & 2 runs (passing). The agent's "not passing" was correct.
+2. **The "fix it" request threw** — *"something went wrong handling that message"* (the in-code catch at the handler, **not** the Telegraf-timeout path). GitHub showed **no new commit/run**, so it threw during the DeepSeek redraft phase — almost certainly the **180s `DEEPSEEK_TIMEOUT_MS`** firing on a reasoning-heavy redraft (the redraft prompt is heavier: buggy code + feedback). Could **not** capture the exact error: **Vercel Hobby caps log queries at 5 minutes and buffers them** (`WARN! Exceeded query duration limit of 5 minutes`), so `vercel logs` never showed the slow background function's output. Two live-capture attempts + `inspect --logs` all failed — the runtime logs for a slow `waitUntil` job are effectively unreachable on Hobby.
+3. Also found: the redraft is fed a **useless CI failure summary** (`Workflow run concluded "failure"` — no assertion detail), so even a successful redraft would be blind to the actual `id: newId` bug. (Not yet fixed — see pick-up list.)
+
+### Strategic pivot — ship a reliable single-PR product; gate the autonomous builder behind a flag (committed `8a5a82f`)
+
+Honest assessment, agreed with the developer: **every failure traces to one thing** — asking a single LLM call to generate whole files on a reasoning-heavy model, run on a serverless webhook with a hard 300s cap. It is **not** a missing DB / MCP / tooling problem (state-across-messages already works without a DB). The autonomous multi-milestone builder is exactly the scope-creep CLAUDE.md warned about; a *real* coding agent needs an execute-observe-iterate loop on a non-serverless backend — a materially bigger build. Decision **(A)**: make the reliable **single focused-change → PR** flow the client-facing default and put the builder behind `ENABLE_AUTONOMOUS_BUILDER` (off by default).
+
+Built:
+- **`handleSinglePrRequest`** — one message → `planSinglePrFiles` → `draftPrFile` (per-file, with retries; lean prompt, no milestone/test/CI framing) → fresh branch → commit → PR. Never a direct write to the default branch; a human merges. Same safety boundary as v1.
+- **Cross-repo, the simple safe way** — `GITHUB_PR_REPOS` is an explicit **named allow-list** (defaults to the target repo when unset). `repo: <name> ...` at the start of a message selects one explicitly; a named-but-unknown repo is **refused, never inferred** (CLAUDE.md Section 5). Issues route to the selected/default repo too. The playground→target promotion machinery is dropped for this path (it existed only for the builder). **Two gates:** the PAT must be scoped to the repo *and* the repo must be on `GITHUB_PR_REPOS` — belt-and-suspenders.
+- **Dispatch:** with the builder off, all pipeline-state routing is skipped — every message is a stateless chat / issue / single-PR request.
+- `.env.example` updated (flag + `GITHUB_PR_REPOS`); **`CLIENT_ONE_PAGER.md`** written (plain-language status to send the client).
+
+### Cross-repo proven live on throwaway infra
+
+Set `GITHUB_PR_REPOS` on Vercel to both throwaway repos (`Target_Repo_For_AgentOps,AgentOpsThrowAway`) via the **clean-file + `cmd /c "... < file"` redirect** method (NOT a PowerShell pipe — avoids the BOM/CRLF corruption documented in the prior session); pulled it back and verified the stored value is clean (76 bytes, no BOM). All three behaviors passed live: **default routing → target, explicit `repo:` selection → throwaway, unlisted repo → refused.**
+
+### Two issues found in the demo — one fixed, one is demo-setup
+
+1. **PR link mangled — FIXED (`c2d2d02`).** The API returned the correct URL; the reply was sent with `parse_mode: "Markdown"`, and the underscores in `Target_Repo_For_AgentOps` rendered as italics, breaking the link. Now **any reply containing a URL is sent as plain text** (Telegram auto-links bare URLs); only conversational replies still use Markdown. Deployed; not yet re-confirmed by eye in Telegram.
+2. **`bot.ts` appearing in "create an app" PRs — NOT a code bug.** The **target repo is a literal copy of this AgentOps codebase** (it contains `src/bot.ts`), so open-ended *"create a weather app"* makes the model wire the feature into the existing bot (edits `src/bot.ts` + adds `weather.ts`). Focused requests are clean (PR #5 *"add a bye.html file"* → only `bye.html`). Fixes are demo-setup: (a) the single-PR flow is for **focused changes**, not whole-app builds; (b) demo against **clean/real project repos**, not a copy of the agent's own code — this literally cannot happen on a normal project repo.
+
+### Deployment state at end of session
+
+Production (`agent-ops` / `agent-ops-gamma.vercel.app`) runs the **single-PR flow with the builder OFF by default**; `GITHUB_PR_REPOS` = both throwaway repos. Latest deploy `agent-fctlyqevt`, health-checked (HTTP 401 on unauthenticated POST = boots clean). All commits pushed to `origin/main` (`c2d2d02` latest: `9df645d` per-file fix, `8a5a82f` single-PR flow, `c2d2d02` link fix). `errors.log` left modified/uncommitted as usual.
+
+---
+
+## Pick up here tomorrow
+
+1. **Re-confirm the link fix** renders a clickable PR link in Telegram (deployed but not yet re-tested by eye — re-run a single-PR request and check the link).
+2. **Live-verify Layer A / point 1 (multi-user)** — this has *still* never been run end to end: message the deployed bot from both the developer's and the client's Telegram accounts → both get replies; a third, unlisted account → silence. The env var (`ALLOWED_TELEGRAM_USER_IDS`) is already correct in Vercel; this just needs the actual test.
+3. **Pick clean demo repos.** For a client-presentable demo, point `GITHUB_PR_REPOS` at clean/real project repos (not the AgentOps-copy target) and drive with **focused** change requests ("add a `/health` endpoint", "add a `bye.html` page") — not "build a whole app."
+4. **Optional small guardrail (discussed, not built):** bias `planSinglePrFiles` toward *adding* focused files rather than modifying core files, as a hedge against the "wire it into everything" tendency on codebase-style repos.
+5. **When ready for the client's real deployment:** they set `GITHUB_PR_REPOS` + a PAT scoped to exactly those repos in their own Vercel, then redeploy. `CLIENT_ONE_PAGER.md` is the plain-language status/handoff to send them.
+6. **Deferred, unchanged:** the autonomous milestone builder needs a real execution-and-iteration backend (sandbox + agent loop, non-serverless) before it's reliable — its own funded phase. Its code stays behind `ENABLE_AUTONOMOUS_BUILDER`. The parked `milestone_ci_failed` state (todo roadmap, `.agent-state/8103097395.json`) is retry-safe but stale; ignore or clear it. If the builder is ever revived: feed the **real** CI failure output into the redraft (currently just `Workflow run concluded "failure"`), and address the reasoning-burn timeout (reasoning-effort control or a leaner code-gen model) — the durable lever behind every builder failure this session.
