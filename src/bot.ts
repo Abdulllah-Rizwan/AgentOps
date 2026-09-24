@@ -121,13 +121,40 @@ function parseRepoEnv(envName: string): RepoRef {
   return { owner, repo };
 }
 
-// PLAYGROUND: the agent's free scratch space. Mistakes here cost nothing - direct commits allowed.
-// TARGET: a real project. The agent's only door in is an opened pull request; a human merges.
-// Both must be named explicitly - never widen this to "any repo the model mentions."
+// PLAYGROUND / TARGET: used only by the autonomous milestone builder (off by default - see
+// builderEnabled). PLAYGROUND is the agent's free scratch space; TARGET is where a finished roadmap
+// is promoted via one PR. Both named explicitly - never "any repo the model mentions."
 const playgroundRepo = parseRepoEnv("GITHUB_PLAYGROUND_REPO");
 const targetRepo = parseRepoEnv("GITHUB_TARGET_REPO");
 
-const allowedRepoKeys = new Set([playgroundRepo, targetRepo].map((r) => `${r.owner}/${r.repo}`));
+// The autonomous multi-milestone builder is OFF by default. It's powerful but brittle on a
+// serverless/webhook backend: long, reasoning-heavy builds fight a hard function-duration cap. The
+// reliable, client-facing path is the single focused change -> one PR flow below. Turn this on
+// ("true") only on infra that can carry long-running builds.
+const builderEnabled = (process.env.ENABLE_AUTONOMOUS_BUILDER ?? "").trim().toLowerCase() === "true";
+
+// Repos the single-PR flow may open PRs / issues into: an explicit, named allow-list - never
+// org-wide, never repo-creation (the CLAUDE.md security line). Defaults to just the target repo so
+// existing single-repo setups keep working; set GITHUB_PR_REPOS="owner/a,owner/b" to let one bot
+// serve several repos. The first entry is the default when a message names no repo.
+function parseRepoList(envName: string): RepoRef[] {
+  const raw = process.env[envName];
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((full) => {
+      const [owner, repo] = full.split("/");
+      if (!owner || !repo) throw new Error(`${envName} entry "${full}" must be in "owner/repo" format.`);
+      return { owner, repo };
+    });
+}
+const configuredPrRepos = parseRepoList("GITHUB_PR_REPOS");
+const singlePrRepos: RepoRef[] = configuredPrRepos.length > 0 ? configuredPrRepos : [targetRepo];
+const defaultPrRepo = singlePrRepos[0];
+
+const allowedRepoKeys = new Set([playgroundRepo, targetRepo, ...singlePrRepos].map((r) => `${r.owner}/${r.repo}`));
 
 function assertRepoAllowed(repo: RepoRef): void {
   const key = `${repo.owner}/${repo.repo}`;
@@ -1034,11 +1061,187 @@ async function handleChat(message: string): Promise<string> {
   return reply ?? "DeepSeek returned an empty response.";
 }
 
+// Explicit, validated repo selection - we never infer a repo from free text. A leading
+// "repo: <name> ..." selects one of the allowed PR repos (by "owner/repo" or bare "repo");
+// otherwise the default (first) repo is used. A named-but-unknown repo is refused, never silently
+// retargeted onto something real (CLAUDE.md Section 5).
+type RepoSelection = { repo: RepoRef; message: string } | { error: string };
+function resolveRepo(message: string): RepoSelection {
+  const m = message.match(/^\s*repo:\s*(\S+)\s*([\s\S]*)$/i);
+  if (!m) return { repo: defaultPrRepo, message };
+  const wanted = m[1].toLowerCase();
+  const rest = m[2].trim();
+  const match = singlePrRepos.find(
+    (r) => `${r.owner}/${r.repo}`.toLowerCase() === wanted || r.repo.toLowerCase() === wanted
+  );
+  if (!match) {
+    const list = singlePrRepos.map((r) => `${r.owner}/${r.repo}`).join(", ");
+    return { error: `I can only act on these repos: ${list}. "${m[1]}" isn't one of them.` };
+  }
+  if (!rest) return { error: `Selected ${match.owner}/${match.repo}, but no change was described. Tell me what to change.` };
+  return { repo: match, message: rest };
+}
+
 async function handleIssueRequest(message: string): Promise<string> {
-  assertRepoAllowed(targetRepo);
-  const { title, body } = await interpretAsIssue(message);
-  const issue = await octokit.rest.issues.create({ owner: targetRepo.owner, repo: targetRepo.repo, title, body });
-  return `Created issue #${issue.data.number}: ${issue.data.html_url}`;
+  const selection = resolveRepo(message);
+  if ("error" in selection) return selection.error;
+  const { repo, message: issueMessage } = selection;
+  assertRepoAllowed(repo);
+  const { title, body } = await interpretAsIssue(issueMessage);
+  const issue = await octokit.rest.issues.create({ owner: repo.owner, repo: repo.repo, title, body });
+  return `Created issue #${issue.data.number} in ${repo.owner}/${repo.repo}: ${issue.data.html_url}`;
+}
+
+// Decide which files a single focused change touches. Leaner than the builder's milestone planner:
+// no milestone framing, no forced tests, just the smallest sensible set of files (or a decline).
+type SinglePrPlan = { canFulfill: true; paths: string[] } | { canFulfill: false; reason: string };
+async function planSinglePrFiles(message: string, repo: RepoRef, fileList: string[]): Promise<SinglePrPlan> {
+  const completion = await deepseek.chat.completions.create({
+    model: "deepseek-v4-flash",
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content:
+          `You decide which files a single focused change touches in ${repo.owner}/${repo.repo}, given its ` +
+          "current file list below. Prefer the smallest sensible set. Reply with ONLY a json object: for a " +
+          'concrete code change, {"canFulfill": true, "paths": ["relative/path.ext", ...]} (reuse existing ' +
+          "paths when editing, sensible new relative paths when creating). If it isn't a concrete change - a " +
+          'question, chit-chat, or too vague - {"canFulfill": false, "reason": "short explanation shown to ' +
+          `the user"}. Use at most ${MAX_FILES_PER_MILESTONE} files. ${TELEGRAM_FORMATTING_NOTE}\n\n` +
+          `Repository files:\n${fileList.join("\n") || "(repository has no files yet)"}`,
+      },
+      { role: "user", content: message },
+    ],
+  });
+  logCompletion("planSinglePrFiles", completion);
+  const raw = completion.choices[0]?.message?.content;
+  if (!raw) {
+    logCompletionReject("planSinglePrFiles", "empty content");
+    return { canFulfill: false, reason: "I couldn't work out a change from that - try describing it more concretely." };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      parsed.canFulfill === true &&
+      Array.isArray(parsed.paths) &&
+      parsed.paths.length > 0 &&
+      parsed.paths.length <= MAX_FILES_PER_MILESTONE &&
+      parsed.paths.every((p: unknown) => typeof p === "string" && isSafeRepoPath(p))
+    ) {
+      return { canFulfill: true, paths: parsed.paths };
+    }
+    if (parsed.canFulfill === false && typeof parsed.reason === "string") {
+      return { canFulfill: false, reason: parsed.reason };
+    }
+    logCompletionReject("planSinglePrFiles", "parsed but invalid shape/paths");
+  } catch (err) {
+    logCompletionReject("planSinglePrFiles", `JSON.parse failed: ${(err as Error).message}`);
+  }
+  return { canFulfill: false, reason: "I couldn't turn that into a valid file change - try rephrasing it." };
+}
+
+// Draft ONE file's complete content for a focused PR change. Separate from the builder's
+// draftOneFile on purpose: a focused edit has no plan, no tests, and no CI/ecosystem framing, so it
+// gets a lean prompt. Retries on unusable output, same as the builder (same reasoning-model variance).
+async function draftPrFile(
+  targetPath: string,
+  changeMessage: string,
+  existingContent: string | null,
+  fileList: string[],
+  allPaths: string[]
+): Promise<string | null> {
+  const label = `draftPrFile(${targetPath})`;
+  for (let attempt = 1; attempt <= CONTENT_DRAFT_ATTEMPTS; attempt++) {
+    const completion = await deepseek.chat.completions.create({
+      model: "deepseek-v4-flash",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            `You make a single focused change to a repository, producing the COMPLETE new content of ` +
+            `exactly this file: ${targetPath}. Reply with ONLY a json object shaped like ` +
+            '{"content": "full file content"} - the whole file, not a diff. Match the repo\'s existing ' +
+            "language, style and conventions; change only what the request needs and keep the rest of the " +
+            "file intact.\n\n" +
+            `The change may touch these files together: ${allPaths.join(", ")}\n\n` +
+            `Repository files:\n${fileList.join("\n") || "(repository has no files yet)"}\n\n` +
+            (existingContent !== null
+              ? `Current content of ${targetPath} (you are editing it):\n${existingContent}`
+              : `${targetPath} does not exist yet - you are creating it.`),
+        },
+        { role: "user", content: changeMessage },
+      ],
+    });
+    logCompletion(label, completion);
+    const raw = completion.choices[0]?.message?.content;
+    if (!raw) {
+      logCompletionReject(label, `attempt ${attempt}: empty content`);
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (isValidFileContent(parsed.content)) {
+        return parsed.content;
+      }
+      logCompletionReject(label, `attempt ${attempt}: "content" missing or not a non-empty string`);
+    } catch (err) {
+      logCompletionReject(label, `attempt ${attempt}: JSON.parse failed: ${(err as Error).message}`);
+    }
+  }
+  return null;
+}
+
+// The reliable client-facing path: one message -> a focused change -> one PR into a named repo.
+// Reads the repo, drafts the file(s), commits to a fresh branch, opens a PR. Never a direct write
+// to the default branch; a human reviews and merges - the same safety boundary as v1.
+async function handleSinglePrRequest(message: string): Promise<string> {
+  const selection = resolveRepo(message);
+  if ("error" in selection) return selection.error;
+  const { repo, message: changeMessage } = selection;
+  assertRepoAllowed(repo);
+
+  const defaultBranch = await getDefaultBranch(repo);
+  const fileList = await fetchRepoFileList(repo, defaultBranch);
+
+  const plan = await planSinglePrFiles(changeMessage, repo, fileList);
+  if (!plan.canFulfill) {
+    return plan.reason;
+  }
+
+  const existing = await Promise.all(
+    plan.paths.map(async (p) => ({ path: p, content: (await fetchFile(repo, p, defaultBranch))?.content ?? null }))
+  );
+  const contents = await Promise.all(
+    plan.paths.map((p, i) => draftPrFile(p, changeMessage, existing[i].content, fileList, plan.paths))
+  );
+  if (contents.some((c) => c === null)) {
+    const failed = plan.paths.filter((_, i) => contents[i] === null).join(", ");
+    logCompletionReject("handleSinglePrRequest", `draft failed for: ${failed}`);
+    return "Sorry, I couldn't draft that change reliably. Try a smaller or clearer request.";
+  }
+  const files: FileChange[] = plan.paths.map((p, i) => ({ path: p, content: contents[i] as string }));
+
+  const base = await octokit.rest.git.getRef({ owner: repo.owner, repo: repo.repo, ref: `heads/${defaultBranch}` });
+  const branchName = `agent/${Date.now()}`;
+  await octokit.rest.git.createRef({
+    owner: repo.owner,
+    repo: repo.repo,
+    ref: `refs/heads/${branchName}`,
+    sha: base.data.object.sha,
+  });
+  const title = firstPlanLine(changeMessage) || "Agent change";
+  await commitFilesToBranch(repo, branchName, files, title);
+  const { data: pr } = await octokit.rest.pulls.create({
+    owner: repo.owner,
+    repo: repo.repo,
+    title: title.slice(0, 250),
+    head: branchName,
+    base: defaultBranch,
+    body: `Requested via Telegram:\n\n> ${changeMessage}\n\nFiles changed: ${files.map((f) => f.path).join(", ")}`,
+  });
+  return `Opened PR #${pr.number} in ${repo.owner}/${repo.repo}: ${pr.html_url}`;
 }
 
 // A fresh "pr"-style request with no pipeline state yet: propose a milestone roadmap, no code.
@@ -1315,7 +1518,7 @@ async function handleStandardIntent(chatId: number, message: string): Promise<st
     return handleIssueRequest(message);
   }
   if (intent === "pr") {
-    return handleRoadmapRequest(chatId, message);
+    return builderEnabled ? handleRoadmapRequest(chatId, message) : handleSinglePrRequest(message);
   }
   return handleChat(message);
 }
@@ -1327,9 +1530,13 @@ bot.on("text", async (ctx) => {
 
   let resultText: string;
   try {
-    const state = await readState(chatId);
+    // With the builder off (the client-facing default), there's no pipeline: every message is a
+    // one-shot chat / issue / single-PR request, handled statelessly.
+    const state = builderEnabled ? await readState(chatId) : null;
 
-    if (state?.phase === "roadmap_pending") {
+    if (!builderEnabled) {
+      resultText = await handleStandardIntent(chatId, message);
+    } else if (state?.phase === "roadmap_pending") {
       const decision = await classifyPlanResponse(state.roadmapText, message);
       if (decision === "approve") {
         resultText = await handleRoadmapApproval(chatId, state);
