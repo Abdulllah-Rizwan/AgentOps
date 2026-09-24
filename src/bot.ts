@@ -70,6 +70,29 @@ const deepseek = new OpenAI({
   maxRetries: 5,
 });
 
+// Structured diagnostics for the DeepSeek calls that can fail silently. An empty, truncated, or
+// unparseable completion comes back as a normal HTTP 200 (finish_reason=stop, no thrown error), so
+// nothing in the stack logs it - the failure just collapses into a generic "couldn't do it" reply.
+// deepseek-v4-flash is a reasoning model whose hidden reasoning-token burn is large and highly
+// variable (measured 13k-29k tokens on byte-identical input, ~60% of runs producing unusable
+// output on a logic-heavy milestone), which is the dominant cause of those failures. Logging
+// finish_reason + token usage + the specific reject reason turns each one into a one-line record.
+function logCompletion(label: string, completion: OpenAI.Chat.Completions.ChatCompletion): void {
+  const choice = completion.choices[0];
+  const usage = completion.usage;
+  console.log(
+    `[deepseek] ${label}: finish_reason=${choice?.finish_reason ?? "?"} ` +
+      `content_len=${choice?.message?.content?.length ?? 0} ` +
+      `completion_tokens=${usage?.completion_tokens ?? "?"} ` +
+      `reasoning_tokens=${usage?.completion_tokens_details?.reasoning_tokens ?? "?"} ` +
+      `prompt_tokens=${usage?.prompt_tokens ?? "?"}`
+  );
+}
+
+function logCompletionReject(label: string, reason: string): void {
+  console.warn(`[deepseek] ${label}: REJECTED - ${reason}`);
+}
+
 const githubPat = process.env.GITHUB_PAT;
 if (!githubPat) {
   throw new Error("GITHUB_PAT is not set. Copy .env.example to .env and fill it in.");
@@ -643,7 +666,9 @@ async function planMilestoneFiles(milestone: Milestone, milestonePlanText: strin
           `You decide which files an already-approved milestone plan touches, for milestone "${milestone.name}" ` +
           `(${milestone.goal}), given the repository's current file list below. Reply with ONLY a json object: ` +
           'if it can be done, {"canFulfill": true, "paths": ["relative/file/path.ext", ...]} — reuse existing ' +
-          "paths from the list when updating files, sensible new relative paths when creating them. If it " +
+          "paths from the list when updating files, sensible new relative paths when creating them. Always " +
+          "include the path(s) for the test file(s) that verify this milestone, in the ecosystem's idiomatic " +
+          "test location, alongside the source files. If it " +
           'genuinely cannot be done, reply {"canFulfill": false, "reason": "short explanation for the developer"}. ' +
           `The "reason" field is the only part of this response a person ever reads. ${MILESTONE_SIZE_NOTE} ` +
           `${TELEGRAM_FORMATTING_NOTE}\n\n` +
@@ -653,8 +678,10 @@ async function planMilestoneFiles(milestone: Milestone, milestonePlanText: strin
     ],
   });
 
+  logCompletion("planMilestoneFiles", completion);
   const raw = completion.choices[0]?.message?.content;
   if (!raw) {
+    logCompletionReject("planMilestoneFiles", "empty content");
     return { canFulfill: false, reason: "DeepSeek returned an empty response while planning the file changes." };
   }
 
@@ -662,6 +689,7 @@ async function planMilestoneFiles(milestone: Milestone, milestonePlanText: strin
     const parsed = JSON.parse(raw);
     if (parsed.canFulfill === true && Array.isArray(parsed.paths) && parsed.paths.length > 0) {
       if (parsed.paths.length > MAX_FILES_PER_MILESTONE) {
+        logCompletionReject("planMilestoneFiles", `too many files: ${parsed.paths.length} > ${MAX_FILES_PER_MILESTONE}`);
         return {
           canFulfill: false,
           reason:
@@ -672,12 +700,14 @@ async function planMilestoneFiles(milestone: Milestone, milestonePlanText: strin
       if (parsed.paths.every((p: unknown) => typeof p === "string" && isSafeRepoPath(p))) {
         return { canFulfill: true, paths: parsed.paths };
       }
+      logCompletionReject("planMilestoneFiles", `paths failed isSafeRepoPath: ${JSON.stringify(parsed.paths)}`);
     }
     if (parsed.canFulfill === false && typeof parsed.reason === "string") {
       return { canFulfill: false, reason: parsed.reason };
     }
-  } catch {
-    // falls through to the generic failure below
+    logCompletionReject("planMilestoneFiles", `parsed but unexpected shape (canFulfill=${JSON.stringify(parsed.canFulfill)})`);
+  } catch (err) {
+    logCompletionReject("planMilestoneFiles", `JSON.parse failed: ${(err as Error).message}`);
   }
   return { canFulfill: false, reason: "Couldn't determine a valid set of file changes from that milestone plan." };
 }
@@ -695,19 +725,113 @@ type CodeAndTestDraft = {
   prBody: string;
 };
 
-function isFileChangeArray(value: unknown): value is FileChange[] {
+function isValidFileContent(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+// Test files are drafted in a second wave, grounded in the just-drafted source, so they match the
+// real API instead of drifting from it. This classifies which of a milestone's paths are tests,
+// across the 7 supported ecosystems (see SUPPORTED_ECOSYSTEMS).
+function isTestPath(p: string): boolean {
+  const tp = p.toLowerCase();
   return (
-    Array.isArray(value) &&
-    value.length > 0 &&
-    value.every(
-      (f): f is FileChange =>
-        typeof f === "object" &&
-        f !== null &&
-        typeof (f as FileChange).path === "string" &&
-        isSafeRepoPath((f as FileChange).path) &&
-        typeof (f as FileChange).content === "string"
-    )
+    /(^|\/)(test|tests|spec|__tests__)\//.test(tp) ||
+    /\.(test|spec)\.[a-z0-9]+$/.test(tp) ||
+    /(^|\/)test_[^/]+\.py$/.test(tp) ||
+    /_test\.[a-z0-9]+$/.test(tp) ||
+    /_spec\.[a-z0-9]+$/.test(tp)
   );
+}
+
+// First non-empty line of the approved plan, stripped of leading markdown heading marks and
+// capped - used to derive a commit message / PR title instead of asking the model for one.
+function firstPlanLine(text: string): string {
+  const line = text.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  return line.replace(/^#+\s*/, "").slice(0, 72);
+}
+
+// How many times to re-ask DeepSeek for ONE file's content when it comes back empty or unparseable.
+// Separate from the SDK's network-level retries (maxRetries), which cover a dropped connection;
+// this covers a completed-but-unusable response. deepseek-v4-flash's hidden reasoning-token burn is
+// large and highly variable (measured 13k-29k on identical input, ~60% of runs producing unusable
+// output on a logic-heavy milestone), so a couple of content-level retries turn a frequent hard
+// failure into a rare one.
+const CONTENT_DRAFT_ATTEMPTS = 3;
+
+// Draft ONE file's complete content, retrying on unusable output. Splitting the old single call
+// (all files + all tests + metadata in one JSON) into one call per file is the core fix: that
+// bundled call drove the reasoning burn to 20k-34k tokens with ~60% unusable output, and any one
+// malformed field threw the whole milestone away. One small file per call keeps each generation
+// short and lets a failure retry just that file.
+async function draftOneFile(args: {
+  targetPath: string;
+  kind: "source" | "test";
+  originalMessage: string;
+  planText: string;
+  allPaths: string[];
+  existingContent: string | null;
+  fileList: string[];
+  siblingSources: FileChange[];
+  logText?: string;
+  revisionFeedback?: string;
+  ciFailureSummary?: string;
+}): Promise<string | null> {
+  const { targetPath, kind, originalMessage, planText, allPaths, existingContent, fileList, siblingSources, logText, revisionFeedback, ciFailureSummary } = args;
+  const label = `draftOneFile(${targetPath})`;
+
+  const siblingSummary = siblingSources.length
+    ? "\n\nThe source file(s) this milestone just produced (match their real API exactly):\n" +
+      siblingSources.map((f) => `--- ${f.path} ---\n${f.content}`).join("\n\n")
+    : "";
+
+  for (let attempt = 1; attempt <= CONTENT_DRAFT_ATTEMPTS; attempt++) {
+    const completion = await deepseek.chat.completions.create({
+      model: "deepseek-v4-flash",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            `You implement one file of an already-approved milestone plan. Produce the COMPLETE content of ` +
+            `exactly this ${kind === "test" ? "test " : ""}file: ${targetPath}. Reply with ONLY a json object ` +
+            'shaped like {"content": "full file content"} - the whole file, not a diff. ' +
+            (kind === "test"
+              ? "Write a real test covering the change's testable logic, using the ecosystem's idiomatic test framework, matching the source file(s) shown below exactly. "
+              : "") +
+            "Keep any sample/fixture content minimal (a handful of representative rows/fields), never an " +
+            `exhaustive dataset. ${STACK_NOTE}\n\n` +
+            `Approved milestone plan:\n${planText}\n\n` +
+            `All files this milestone touches:\n${allPaths.join("\n")}\n\n` +
+            `Repository files:\n${fileList.join("\n") || "(repository has no files yet)"}\n\n` +
+            (existingContent !== null
+              ? `Current content of ${targetPath} (you are updating it):\n${existingContent}`
+              : `${targetPath} does not exist yet - you are creating it.`) +
+            siblingSummary +
+            (logText ? `\n\nWork already completed in earlier milestones:\n${logText}` : "") +
+            (revisionFeedback ? `\n\nThe previous attempt needs revision. Feedback:\n${revisionFeedback}` : "") +
+            (ciFailureSummary ? `\n\nThe previous attempt's tests failed in CI:\n${ciFailureSummary}` : ""),
+        },
+        { role: "user", content: originalMessage },
+      ],
+    });
+
+    logCompletion(`${label} attempt ${attempt}`, completion);
+    const raw = completion.choices[0]?.message?.content;
+    if (!raw) {
+      logCompletionReject(label, `attempt ${attempt}: empty content`);
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (isValidFileContent(parsed.content)) {
+        return parsed.content;
+      }
+      logCompletionReject(label, `attempt ${attempt}: "content" missing or not a non-empty string`);
+    } catch (err) {
+      logCompletionReject(label, `attempt ${attempt}: JSON.parse failed: ${(err as Error).message}`);
+    }
+  }
+  return null;
 }
 
 async function draftCodeAndTests(
@@ -720,69 +844,49 @@ async function draftCodeAndTests(
   revisionFeedback?: string,
   ciFailureSummary?: string
 ): Promise<CodeAndTestDraft | null> {
-  const existingSummary = existingFiles
-    .map(({ path, content }) =>
-      content !== null ? `Current content of ${path}:\n${content}` : `${path} does not exist yet - this change will create it.`
-    )
-    .join("\n\n");
-
-  const completion = await deepseek.chat.completions.create({
-    model: "deepseek-v4-flash",
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content:
-          "You implement an already-approved milestone plan as a focused set of file changes, PLUS test file(s) " +
-          "that verify them, for a repository whose current file list and (for files that already exist) " +
-          'current content are given below. Reply with ONLY a json object shaped like {"files": ' +
-          '[{"path": "relative/file/path.ext", "content": "full new file content"}], "tests": ' +
-          '[{"path": "relative/test/path.ext", "content": "full test file content"}], "commitMessage": ' +
-          '"short commit message", "prTitle": "short PR title", "prBody": "PR description"}. Every "content" ' +
-          "must be the COMPLETE content of that file, not a diff. Every path in \"files\" must be exactly one " +
-          `of these target files: ${paths.join(", ")}. Include at least one test file covering the change's ` +
-          "testable logic, using that ecosystem's idiomatic test location and framework. Keep any generated " +
-          "sample/fixture content minimal (a handful of representative rows/fields), never an exhaustive " +
-          `dataset - this has to generate quickly. ${STACK_NOTE}\n\n` +
-          `Approved milestone plan:\n${planText}\n\n` +
-          `Target files:\n${paths.join("\n")}\n\n` +
-          `Repository files:\n${fileList.join("\n") || "(repository has no files yet)"}\n\n` +
-          existingSummary +
-          (logText ? `\n\nWork already completed in earlier milestones:\n${logText}` : "") +
-          (revisionFeedback ? `\n\nThe previous attempt needs revision. Feedback:\n${revisionFeedback}` : "") +
-          (ciFailureSummary ? `\n\nThe previous attempt's tests failed in CI:\n${ciFailureSummary}` : ""),
-      },
-      { role: "user", content: originalMessage },
-    ],
-  });
-
-  const raw = completion.choices[0]?.message?.content;
-  if (!raw) {
+  const safePaths = paths.filter((p) => isSafeRepoPath(p));
+  if (safePaths.length === 0 || safePaths.length > MAX_ARTIFACTS_PER_MILESTONE) {
+    logCompletionReject(
+      "draftCodeAndTests",
+      `unexpected path set (${safePaths.length} of ${paths.length} safe, cap ${MAX_ARTIFACTS_PER_MILESTONE})`
+    );
     return null;
   }
+  const existingByPath = new Map(existingFiles.map((f) => [f.path, f.content]));
+  const sourcePaths = safePaths.filter((p) => !isTestPath(p));
+  const testPaths = safePaths.filter((p) => isTestPath(p));
 
-  try {
-    const parsed = JSON.parse(raw);
-    if (
-      isFileChangeArray(parsed.files) &&
-      isFileChangeArray(parsed.tests) &&
-      parsed.files.length + parsed.tests.length <= MAX_ARTIFACTS_PER_MILESTONE &&
-      typeof parsed.commitMessage === "string" &&
-      typeof parsed.prTitle === "string" &&
-      typeof parsed.prBody === "string"
-    ) {
-      return {
-        files: parsed.files,
-        tests: parsed.tests,
-        commitMessage: parsed.commitMessage,
-        prTitle: parsed.prTitle,
-        prBody: parsed.prBody,
-      };
-    }
-  } catch {
-    // falls through to the null return below
+  const common = { originalMessage, planText, allPaths: safePaths, fileList, logText, revisionFeedback, ciFailureSummary };
+
+  // Wave 1: source files, in parallel (each its own small completion).
+  const sourceContents = await Promise.all(
+    sourcePaths.map((p) =>
+      draftOneFile({ ...common, targetPath: p, kind: "source", existingContent: existingByPath.get(p) ?? null, siblingSources: [] })
+    )
+  );
+  if (sourceContents.some((c) => c === null)) {
+    logCompletionReject("draftCodeAndTests", `source draft failed for: ${sourcePaths.filter((_, i) => sourceContents[i] === null).join(", ")}`);
+    return null;
   }
-  return null;
+  const files: FileChange[] = sourcePaths.map((p, i) => ({ path: p, content: sourceContents[i] as string }));
+
+  // Wave 2: test files, grounded in the source just drafted so they can't drift from its real API.
+  const testContents = await Promise.all(
+    testPaths.map((p) =>
+      draftOneFile({ ...common, targetPath: p, kind: "test", existingContent: existingByPath.get(p) ?? null, siblingSources: files })
+    )
+  );
+  if (testContents.some((c) => c === null)) {
+    logCompletionReject("draftCodeAndTests", `test draft failed for: ${testPaths.filter((_, i) => testContents[i] === null).join(", ")}`);
+    return null;
+  }
+  const tests: FileChange[] = testPaths.map((p, i) => ({ path: p, content: testContents[i] as string }));
+
+  // Metadata is derived, not model-generated: prTitle was never read anywhere, and deriving
+  // commitMessage/summary from the approved plan removes a whole failure surface (the old bundled
+  // call could return valid files but one malformed metadata field and be discarded entirely).
+  const commitMessage = firstPlanLine(planText) || "Milestone changes";
+  return { files, tests, commitMessage, prTitle: commitMessage, prBody: planText };
 }
 
 // Shared by every commit onto the persistent playground branch and by the final target
@@ -1122,15 +1226,18 @@ async function handleMilestoneCiFailureRevision(
   feedback: string
 ): Promise<string> {
   const fileList = await fetchRepoFileList(playgroundRepo, state.branchName);
+  // Re-draft both source and test files on a CI failure: a failing test often needs the source
+  // fixed AND the test adjusted, and the new source-then-test drafting keeps them consistent.
+  const milestonePaths = [...state.filePaths, ...state.testPaths];
   const existingFiles = await Promise.all(
-    state.filePaths.map(async (path) => ({ path, content: (await fetchFile(playgroundRepo, path, state.branchName))?.content ?? null }))
+    milestonePaths.map(async (path) => ({ path, content: (await fetchFile(playgroundRepo, path, state.branchName))?.content ?? null }))
   );
   const logText = await readProjectLog(chatId, state.branchName);
 
   const draft = await draftCodeAndTests(
     state.originalMessage,
     state.milestonePlanText,
-    state.filePaths,
+    milestonePaths,
     existingFiles,
     fileList,
     logText,
