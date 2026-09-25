@@ -121,9 +121,11 @@ function parseRepoEnv(envName: string): RepoRef {
   return { owner, repo };
 }
 
-// PLAYGROUND / TARGET: used only by the autonomous milestone builder (off by default - see
-// builderEnabled). PLAYGROUND is the agent's free scratch space; TARGET is where a finished roadmap
-// is promoted via one PR. Both named explicitly - never "any repo the model mentions."
+// PLAYGROUND / TARGET: PLAYGROUND is the agent's scratch space for the autonomous milestone builder
+// (off by default - see builderEnabled) AND now also holds the small conversation-continuity state
+// file (.agent-state/<chatId>.json) for the client-facing flow, so a "which repo?" question survives
+// between serverless invocations. TARGET is where a finished roadmap is promoted via one PR. Both are
+// named explicitly - never "any repo the model mentions." (The PAT needs write access to PLAYGROUND.)
 const playgroundRepo = parseRepoEnv("GITHUB_PLAYGROUND_REPO");
 const targetRepo = parseRepoEnv("GITHUB_TARGET_REPO");
 
@@ -353,9 +355,17 @@ async function fetchFile(repo: RepoRef, path: string, ref: string): Promise<{ co
   }
 }
 
+// A repo's default branch doesn't change mid-flight, and this is called several times per request
+// (plus once per message now that state is read every time) - so memoise it per repo to cut GitHub
+// round trips. The cache lives for the process; on serverless that's effectively per-invocation.
+const defaultBranchCache = new Map<string, string>();
 async function getDefaultBranch(repo: RepoRef): Promise<string> {
   assertRepoAllowed(repo);
+  const key = `${repo.owner}/${repo.repo}`;
+  const cached = defaultBranchCache.get(key);
+  if (cached) return cached;
   const { data: repoInfo } = await octokit.rest.repos.get({ owner: repo.owner, repo: repo.repo });
+  defaultBranchCache.set(key, repoInfo.default_branch);
   return repoInfo.default_branch;
 }
 
@@ -397,7 +407,25 @@ type MilestoneCodeFields = RoadmapFields & {
 
 // Each phase is its own variant (not a union'd "phase" field on one shared shape) so that
 // Extract<PipelineState, { phase: "..." }> narrows correctly at every call site below.
+// What a just-opened single PR touched, remembered so the user can promote the SAME change into
+// another allowed repo (the playground -> target bridge, CLAUDE.md Section 4) without the agent
+// having to re-plan or re-know what it built. Content isn't stored - it's re-read from the branch.
+type LastPrFields = {
+  sourceRepo: RepoRef;
+  branch: string;
+  paths: string[];
+  requestMessage: string;
+  prUrl: string;
+};
+
 type PipelineState =
+  // Client-facing (builder-off) flow: we asked "which repo?" and are holding the original request
+  // until the user answers, so the answer and the remembered request can be combined.
+  | { phase: "awaiting_repo_choice"; pendingMessage: string; pendingIntent: "issue" | "pr" }
+  // A single PR was just opened; the user may ask to promote the same change into another repo.
+  | ({ phase: "pr_opened" } & LastPrFields)
+  // Promote was requested but the destination repo was unclear; waiting for the user to name it.
+  | ({ phase: "awaiting_promote_target" } & LastPrFields)
   | { phase: "roadmap_pending"; originalMessage: string; roadmapText: string; milestones: Milestone[] }
   | ({ phase: "milestone_plan_pending" } & RoadmapFields & { milestoneIndex: number; milestonePlanText: string })
   | ({ phase: "milestone_pending_ci" } & MilestoneCodeFields)
@@ -1061,14 +1089,19 @@ async function handleChat(message: string): Promise<string> {
   return reply ?? "DeepSeek returned an empty response.";
 }
 
-// Explicit, validated repo selection - we never infer a repo from free text. A leading
-// "repo: <name> ..." selects one of the allowed PR repos (by "owner/repo" or bare "repo");
-// otherwise the default (first) repo is used. A named-but-unknown repo is refused, never silently
-// retargeted onto something real (CLAUDE.md Section 5).
-type RepoSelection = { repo: RepoRef; message: string } | { error: string };
-function resolveRepo(message: string): RepoSelection {
+// --- Repo selection ------------------------------------------------------------------------------
+// The agent may CHOOSE which allowed repo to act on (CLAUDE.md Section 5 explicitly permits this) -
+// the security boundary is that the chosen repo is always validated against the named allow-list and
+// anything off-list is refused, never invented. Two layers:
+//   1. An explicit "repo: <name> ..." prefix (power users / unambiguous) - exact, no LLM.
+//   2. Otherwise DeepSeek picks the intended repo from natural phrasing ("the throwaway one"). If it
+//      can't tell, we ASK rather than silently defaulting (the frustrating surprise we're fixing).
+
+// Explicit "repo: <name> ..." selector. Returns null when there's no such prefix (so the caller can
+// fall through to the smart pick), an error for an off-list / empty request, or the resolved repo.
+function resolveExplicitRepo(message: string): { repo: RepoRef; message: string } | { error: string } | null {
   const m = message.match(/^\s*repo:\s*(\S+)\s*([\s\S]*)$/i);
-  if (!m) return { repo: defaultPrRepo, message };
+  if (!m) return null;
   const wanted = m[1].toLowerCase();
   const rest = m[2].trim();
   const match = singlePrRepos.find(
@@ -1082,10 +1115,79 @@ function resolveRepo(message: string): RepoSelection {
   return { repo: match, message: rest };
 }
 
-async function handleIssueRequest(message: string): Promise<string> {
-  const selection = resolveRepo(message);
-  if ("error" in selection) return selection.error;
-  const { repo, message: issueMessage } = selection;
+// DeepSeek maps a message to one of the allow-listed repos (matching informal names), or "ambiguous"
+// when it can't tell. The returned repo is re-validated against the allow-list here - we never act on
+// a repo string the model emits that isn't on the list (CLAUDE.md Section 5).
+async function pickRepo(message: string): Promise<RepoRef | "ambiguous"> {
+  const options = singlePrRepos.map((r) => `${r.owner}/${r.repo}`).join("\n");
+  const completion = await deepseek.chat.completions.create({
+    model: "deepseek-v4-flash",
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content:
+          `The user wants a code change or issue made in ONE of these repositories:\n${options}\n\n` +
+          `Decide which one they mean. Match generously on partial or informal names (e.g. ` +
+          `"throwaway", "the playground", a bare repo name, or a distinctive word from the name). ` +
+          `Reply with ONLY JSON: {"repo": "owner/repo"} using EXACTLY one of the strings above when ` +
+          `the message clearly indicates one, otherwise {"ambiguous": true}. Never invent a repo not listed.`,
+      },
+      { role: "user", content: message },
+    ],
+  });
+  logCompletion("pickRepo", completion);
+  const raw = completion.choices[0]?.message?.content;
+  if (!raw) return "ambiguous";
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.repo === "string") {
+      const wanted = parsed.repo.toLowerCase();
+      const match = singlePrRepos.find(
+        (r) => `${r.owner}/${r.repo}`.toLowerCase() === wanted || r.repo.toLowerCase() === wanted
+      );
+      if (match) return match; // validated against the allow-list
+    }
+  } catch {
+    // falls through to ambiguous
+  }
+  return "ambiguous";
+}
+
+// The full resolution used by the client-facing (builder-off) flow. `fromExplicit` tells the caller
+// whether the message carried its own request text (a "repo: X <request>" prefix) vs. just naming a
+// repo - which matters when the message is an answer to an earlier "which repo?" question.
+type RepoResolution =
+  | { kind: "repo"; repo: RepoRef; message: string; fromExplicit: boolean }
+  | { kind: "ask"; text: string }
+  | { kind: "error"; text: string };
+
+async function resolveRepoForRequest(message: string): Promise<RepoResolution> {
+  const explicit = resolveExplicitRepo(message);
+  if (explicit) {
+    return "error" in explicit
+      ? { kind: "error", text: explicit.error }
+      : { kind: "repo", repo: explicit.repo, message: explicit.message, fromExplicit: true };
+  }
+  // No explicit prefix. With a single allowed repo there's nothing to choose - use it (no LLM call,
+  // no change from today's behaviour for a single-target client deployment).
+  if (singlePrRepos.length === 1) {
+    return { kind: "repo", repo: singlePrRepos[0], message, fromExplicit: false };
+  }
+  const picked = await pickRepo(message);
+  if (picked === "ambiguous") {
+    const names = singlePrRepos.map((r) => `\`${r.owner}/${r.repo}\``).join(", ");
+    return {
+      kind: "ask",
+      text:
+        `Which repo should I use for this? I can work in: ${names}.\n\n` +
+        `Just reply with the one you mean (e.g. "the throwaway one") and I'll go ahead with your request.`,
+    };
+  }
+  return { kind: "repo", repo: picked, message, fromExplicit: false };
+}
+
+async function handleIssueRequest(issueMessage: string, repo: RepoRef): Promise<string> {
   assertRepoAllowed(repo);
   const { title, body } = await interpretAsIssue(issueMessage);
   const issue = await octokit.rest.issues.create({ owner: repo.owner, repo: repo.repo, title, body });
@@ -1196,10 +1298,7 @@ async function draftPrFile(
 // The reliable client-facing path: one message -> a focused change -> one PR into a named repo.
 // Reads the repo, drafts the file(s), commits to a fresh branch, opens a PR. Never a direct write
 // to the default branch; a human reviews and merges - the same safety boundary as v1.
-async function handleSinglePrRequest(message: string): Promise<string> {
-  const selection = resolveRepo(message);
-  if ("error" in selection) return selection.error;
-  const { repo, message: changeMessage } = selection;
+async function handleSinglePrRequest(changeMessage: string, repo: RepoRef, chatId: number): Promise<string> {
   assertRepoAllowed(repo);
 
   const defaultBranch = await getDefaultBranch(repo);
@@ -1240,6 +1339,15 @@ async function handleSinglePrRequest(message: string): Promise<string> {
     head: branchName,
     base: defaultBranch,
     body: `Requested via Telegram:\n\n> ${changeMessage}\n\nFiles changed: ${files.map((f) => f.path).join(", ")}`,
+  });
+  // Remember this PR so the next message can promote the same change into another allowed repo.
+  await writeState(chatId, {
+    phase: "pr_opened",
+    sourceRepo: repo,
+    branch: branchName,
+    paths: files.map((f) => f.path),
+    requestMessage: changeMessage,
+    prUrl: pr.html_url,
   });
   return `Opened PR #${pr.number} in ${repo.owner}/${repo.repo}: ${pr.html_url}`;
 }
@@ -1512,15 +1620,199 @@ async function handleRoadmapPromoteRevision(
   return startMilestonePlan(chatId, roadmapCtx, milestones.length - 1);
 }
 
+// Builder-ON only: the pipeline dispatch falls through here for messages unrelated to a pending
+// roadmap. Repo resolution stays simple (explicit prefix, else default) - the smart-pick/ask
+// continuity below is scoped to the client-facing builder-off flow.
 async function handleStandardIntent(chatId: number, message: string): Promise<string> {
   const intent = await classifyIntent(message);
   if (intent === "issue") {
-    return handleIssueRequest(message);
+    const sel = resolveExplicitRepo(message) ?? { repo: defaultPrRepo, message };
+    if ("error" in sel) return sel.error;
+    return handleIssueRequest(sel.message, sel.repo);
   }
   if (intent === "pr") {
-    return builderEnabled ? handleRoadmapRequest(chatId, message) : handleSinglePrRequest(message);
+    return handleRoadmapRequest(chatId, message);
   }
   return handleChat(message);
+}
+
+async function runStandardIntent(chatId: number, intent: "issue" | "pr", message: string, repo: RepoRef): Promise<string> {
+  return intent === "issue" ? handleIssueRequest(message, repo) : handleSinglePrRequest(message, repo, chatId);
+}
+
+// Client-facing (builder-off) entry for a fresh message: classify, then for an issue/PR resolve the
+// repo. If the repo is unclear, remember the request and ASK - so the follow-up answer can complete it.
+async function handleFreshStandard(chatId: number, message: string): Promise<string> {
+  const intent = await classifyIntent(message);
+  if (intent === "chat") {
+    return handleChat(message);
+  }
+  const resolution = await resolveRepoForRequest(message);
+  if (resolution.kind === "error") {
+    return resolution.text;
+  }
+  if (resolution.kind === "ask") {
+    await writeState(chatId, { phase: "awaiting_repo_choice", pendingMessage: message, pendingIntent: intent });
+    return resolution.text;
+  }
+  return runStandardIntent(chatId, intent, resolution.message, resolution.repo);
+}
+
+// The user is answering an earlier "which repo?" question. Resolve the repo from their reply and run
+// the ORIGINAL remembered request against it - unless they re-typed a full "repo: X <request>", in
+// which case honour the new request text. An off-list repo keeps us waiting; anything that names no
+// repo at all is treated as a brand-new message rather than looping forever.
+async function handleRepoChoiceAnswer(
+  chatId: number,
+  state: Extract<PipelineState, { phase: "awaiting_repo_choice" }>,
+  message: string
+): Promise<string> {
+  const resolution = await resolveRepoForRequest(message);
+  if (resolution.kind === "error") {
+    return resolution.text; // off-list repo named - report and keep the pending request alive
+  }
+  if (resolution.kind === "repo") {
+    await clearState(chatId);
+    const request = resolution.fromExplicit && resolution.message.trim() ? resolution.message : state.pendingMessage;
+    return runStandardIntent(chatId, state.pendingIntent, request, resolution.repo);
+  }
+  // Still can't tell which repo - the reply wasn't a repo answer. Drop the pending request and treat
+  // this as a new message so we don't ask the same question forever.
+  await clearState(chatId);
+  return handleFreshStandard(chatId, message);
+}
+
+// --- Promote a just-opened PR into another repo (the playground -> target bridge) -----------------
+
+function lastPrFields(s: LastPrFields): LastPrFields {
+  return { sourceRepo: s.sourceRepo, branch: s.branch, paths: s.paths, requestMessage: s.requestMessage, prUrl: s.prUrl };
+}
+
+// After a PR is open, does the next message ask to open the SAME change in ANOTHER repo (vs. a new
+// change or chit-chat)? Kept separate from classifyIntent because it's only meaningful in this state.
+async function classifyPromoteIntent(message: string): Promise<boolean> {
+  const completion = await deepseek.chat.completions.create({
+    model: "deepseek-v4-flash",
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content:
+          `You just opened a pull request with a change for the user. Classify their NEXT message. ` +
+          `Reply ONLY JSON {"promote": true} if they want that SAME change opened/copied/raised in ANOTHER ` +
+          `repository (e.g. "raise the same PR in the target repo", "now do this in X too", "promote it to X"). ` +
+          `Reply {"promote": false} for anything else - a brand-new or different change, a tweak, or chit-chat.`,
+      },
+      { role: "user", content: message },
+    ],
+  });
+  logCompletion("classifyPromoteIntent", completion);
+  const raw = completion.choices[0]?.message?.content;
+  if (!raw) return false;
+  try {
+    return JSON.parse(raw).promote === true;
+  } catch {
+    return false;
+  }
+}
+
+// Copies the exact files from the source PR's branch into a fresh branch on `dest` and opens a PR
+// there - the same PR-not-direct-write boundary as everything else. No re-planning, so it works
+// regardless of what dest already contains. Never a clone-and-push; a human still merges.
+async function promotePr(chatId: number, ctx: LastPrFields, dest: RepoRef): Promise<string> {
+  assertRepoAllowed(ctx.sourceRepo);
+  assertRepoAllowed(dest);
+
+  const files = await Promise.all(
+    ctx.paths.map(async (path) => {
+      const file = await fetchFile(ctx.sourceRepo, path, ctx.branch);
+      if (!file) {
+        throw new Error(`Expected ${path} on ${ctx.sourceRepo.owner}/${ctx.sourceRepo.repo}@${ctx.branch} but it was missing.`);
+      }
+      return { path, content: file.content };
+    })
+  );
+
+  const destDefault = await getDefaultBranch(dest);
+  const base = await octokit.rest.git.getRef({ owner: dest.owner, repo: dest.repo, ref: `heads/${destDefault}` });
+  const branchName = `agent/${Date.now()}`;
+  await octokit.rest.git.createRef({ owner: dest.owner, repo: dest.repo, ref: `refs/heads/${branchName}`, sha: base.data.object.sha });
+
+  const title = firstPlanLine(ctx.requestMessage) || "Agent change";
+  await commitFilesToBranch(dest, branchName, files, title);
+  const { data: pr } = await octokit.rest.pulls.create({
+    owner: dest.owner,
+    repo: dest.repo,
+    title: title.slice(0, 250),
+    head: branchName,
+    base: destDefault,
+    body:
+      `Promoted from ${ctx.sourceRepo.owner}/${ctx.sourceRepo.repo} (${ctx.prUrl}).\n\n` +
+      `Original request:\n\n> ${ctx.requestMessage}\n\nFiles: ${files.map((f) => f.path).join(", ")}`,
+  });
+
+  // Point the "last PR" at the new one, so the user can chain-promote to a further repo.
+  await writeState(chatId, {
+    phase: "pr_opened",
+    sourceRepo: dest,
+    branch: branchName,
+    paths: ctx.paths,
+    requestMessage: ctx.requestMessage,
+    prUrl: pr.html_url,
+  });
+  return `Opened PR #${pr.number} in ${dest.owner}/${dest.repo}: ${pr.html_url}`;
+}
+
+async function promoteToResolved(chatId: number, ctx: LastPrFields, dest: RepoRef): Promise<string> {
+  if (dest.owner === ctx.sourceRepo.owner && dest.repo === ctx.sourceRepo.repo) {
+    await writeState(chatId, { phase: "pr_opened", ...lastPrFields(ctx) });
+    return `That change is already in ${dest.owner}/${dest.repo} (${ctx.prUrl}). Name a different repo to copy it into.`;
+  }
+  return promotePr(chatId, lastPrFields(ctx), dest);
+}
+
+// A single PR is open. If the user wants the same change elsewhere, promote it; otherwise treat the
+// message as new (without clearing - a chat reply leaves the promote option available, and a new
+// PR/issue/ask overwrites the state itself).
+async function handlePrOpenedFollowup(
+  chatId: number,
+  state: Extract<PipelineState, { phase: "pr_opened" }>,
+  message: string
+): Promise<string> {
+  if (await classifyPromoteIntent(message)) {
+    const resolution = await resolveRepoForRequest(message);
+    if (resolution.kind === "error") {
+      return resolution.text;
+    }
+    if (resolution.kind === "ask") {
+      await writeState(chatId, { phase: "awaiting_promote_target", ...lastPrFields(state) });
+      const names = singlePrRepos.map((r) => `\`${r.owner}/${r.repo}\``).join(", ");
+      return (
+        `Which repo should I open the same change in? I can use: ${names}. ` +
+        `(It's currently in \`${state.sourceRepo.owner}/${state.sourceRepo.repo}\`.)`
+      );
+    }
+    return promoteToResolved(chatId, state, resolution.repo);
+  }
+  return handleFreshStandard(chatId, message);
+}
+
+// The user is naming which repo to promote the remembered change into.
+async function handlePromoteTargetAnswer(
+  chatId: number,
+  state: Extract<PipelineState, { phase: "awaiting_promote_target" }>,
+  message: string
+): Promise<string> {
+  const resolution = await resolveRepoForRequest(message);
+  if (resolution.kind === "error") {
+    return resolution.text;
+  }
+  if (resolution.kind === "repo") {
+    return promoteToResolved(chatId, state, resolution.repo);
+  }
+  // The reply didn't name a repo - treat it as a new message rather than looping on the question.
+  await clearState(chatId);
+  return handleFreshStandard(chatId, message);
 }
 
 bot.on("text", async (ctx) => {
@@ -1530,12 +1822,20 @@ bot.on("text", async (ctx) => {
 
   let resultText: string;
   try {
-    // With the builder off (the client-facing default), there's no pipeline: every message is a
-    // one-shot chat / issue / single-PR request, handled statelessly.
-    const state = builderEnabled ? await readState(chatId) : null;
+    // State is read in both modes now: the builder needs its pipeline state, and the client-facing
+    // (builder-off) flow needs to know whether we're waiting on an answer to a "which repo?" question.
+    const state = await readState(chatId);
 
     if (!builderEnabled) {
-      resultText = await handleStandardIntent(chatId, message);
+      if (state?.phase === "awaiting_repo_choice") {
+        resultText = await handleRepoChoiceAnswer(chatId, state, message);
+      } else if (state?.phase === "pr_opened") {
+        resultText = await handlePrOpenedFollowup(chatId, state, message);
+      } else if (state?.phase === "awaiting_promote_target") {
+        resultText = await handlePromoteTargetAnswer(chatId, state, message);
+      } else {
+        resultText = await handleFreshStandard(chatId, message);
+      }
     } else if (state?.phase === "roadmap_pending") {
       const decision = await classifyPlanResponse(state.roadmapText, message);
       if (decision === "approve") {

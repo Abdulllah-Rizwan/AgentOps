@@ -483,3 +483,49 @@ Production (`agent-ops` / `agent-ops-gamma.vercel.app`) runs the **single-PR flo
 4. **Optional small guardrail (discussed, not built):** bias `planSinglePrFiles` toward *adding* focused files rather than modifying core files, as a hedge against the "wire it into everything" tendency on codebase-style repos.
 5. **When ready for the client's real deployment:** they set `GITHUB_PR_REPOS` + a PAT scoped to exactly those repos in their own Vercel, then redeploy. `CLIENT_ONE_PAGER.md` is the plain-language status/handoff to send them.
 6. **Deferred, unchanged:** the autonomous milestone builder needs a real execution-and-iteration backend (sandbox + agent loop, non-serverless) before it's reliable — its own funded phase. Its code stays behind `ENABLE_AUTONOMOUS_BUILDER`. The parked `milestone_ci_failed` state (todo roadmap, `.agent-state/8103097395.json`) is retry-safe but stale; ignore or clear it. If the builder is ever revived: feed the **real** CI failure output into the redraft (currently just `Workflow run concluded "failure"`), and address the reasoning-burn timeout (reasoning-effort control or a leaner code-gen model) — the durable lever behind every builder failure this session.
+
+---
+
+## Session 2026-09-25 — Smart repo selection, conversational continuity, and the promote-to-target bridge
+
+All three features below were built on the client-facing **single-PR flow (builder OFF)**; the autonomous builder was left untouched. Each was live-verified end-to-end through the deployed Vercel webhook before this write-up, and `tsc --noEmit` is clean.
+
+### Motivating problems (both found by the developer in live use)
+
+1. **Rigid repo selection was bad UX.** The prior design (this session's first change) required an explicit `repo: <name>` prefix and *silently defaulted* to the first `GITHUB_PR_REPOS` entry otherwise — so "write a todo app in the throwaway repo" opened the PR in **target**, ignoring the prose. First attempt at a fix was a keyword "nudge" (detect a non-default repo named in the text, ask the user to confirm with an explicit selector); it was **superseded within the session** by the smarter LLM-based selection below once the developer (reasonably) objected that reading a template and retyping a repo name by hand is frustrating.
+2. **No state/continuity across a clarification.** Every single-PR message was handled in isolation. So "build a todo app" → (agent asks which repo) → "the throwaway one" broke: by the time the repo answer arrived, the agent had forgotten what to build. `resolveRepo` saw a repo name with no change described and gave up.
+3. **No memory of what was just built → promote impossible.** After opening PR #15 (a calorie tracker) in playground, the developer asked "now raise a PR in the target repo." The stateless flow tried to *re-plan* a fresh change against target (a copy of the AgentOps bot codebase), found no calorie tracker there, and declined — the exact playground→target bridge from CLAUDE.md Section 4 that the single-PR pivot had dropped.
+
+### Design decision confirmed with the developer (per Section 11)
+
+Asked one sharp scoping question rather than building wide: the developer explicitly requested "prior 20–30 exchanges in memory." Pushed back and offered the **targeted-continuity** slice instead — remember only the *active* in-progress request across a clarification, not a rolling window — because (a) it fixes the actual bug, (b) full rolling memory would bloat every call on `deepseek-v4-flash`, the reasoning model already behind this project's milestone-failure history, and (c) CLAUDE.md Section 8 defers persistent memory. Developer chose the targeted slice.
+
+Also reaffirmed the security line: CLAUDE.md Section 5 **explicitly permits the agent to choose among repos** — the boundary is that every chosen repo is validated against the named allow-list and anything off-list is refused, never invented. So LLM-based repo selection is on-spec, not a widening; the earlier "never infer from free text" was stricter than required.
+
+### Built (`src/bot.ts`)
+
+- **Smart repo selection** — `resolveExplicitRepo` (the exact `repo:` prefix path, unchanged) + `pickRepo` (DeepSeek maps informal phrasing — "throwaway", "the playground", a partial name — to one allow-listed repo, **re-validated against the allow-list**; unknown/unsure → `"ambiguous"`, never invented) + `resolveRepoForRequest` (explicit → smart → ask). A single-repo config skips the LLM entirely (no behaviour change for a single-target client deployment). When >1 repo and the message names none, it **asks** instead of silently defaulting.
+- **Targeted continuity** — new `awaiting_repo_choice` state (`pendingMessage` + `pendingIntent`), reusing the existing GitHub-file state mechanism (`.agent-state/<chatId>.json` in the playground repo). On the answer, the remembered request is combined with the chosen repo. A re-typed `repo: X <new request>` answer honours the new request; an answer that names no repo is treated as a fresh message rather than looping.
+- **Promote-to-target bridge** (CLAUDE.md Section 4, restored) — after every single PR, a `pr_opened` state records the source repo, branch, touched paths, request text, and PR url. `classifyPromoteIntent` distinguishes "open the SAME change in another repo" from a new request/chit-chat; `promotePr` **copies the exact drafted files from the source branch** into a fresh branch on the destination and opens a PR there — no re-planning, so it works regardless of what the destination already contains. Ambiguous destination → `awaiting_promote_target` state asks which repo. Promotion is chainable (state re-points at the new PR).
+
+### Safety properties held (verified against the code, not assumed)
+
+- **PR only, human merges** everywhere — promotion is copy-files-into-a-new-branch-and-open-a-PR, **never** a clone-and-push or auto-merge.
+- **`commitFilesToBranch` uses `base_tree`** (confirmed at the call site) — promoting a handful of files *adds/overwrites* only those paths and preserves everything else in the destination; it cannot wipe the target repo.
+- **Allow-list is the boundary** — both `pickRepo`'s output and the explicit selector are validated against `singlePrRepos`; off-list is refused. The `repo:`-prefix + PAT-scope belt-and-suspenders is unchanged.
+- Live-verified this session: off-list repo refused; ambiguous → ask → answer completes the original request; issue routing still correct; a new request right after a PR does not mis-promote.
+
+### Incidental changes
+
+- `handleIssueRequest` / `handleSinglePrRequest` refactored to take an already-resolved `RepoRef` (single responsibility); repo resolution now happens once in the dispatch layer. `handleSinglePrRequest` also takes `chatId` (to record `pr_opened`).
+- `getDefaultBranch` is now **memoised per repo** (a process-lifetime `Map`) — offsets the extra state read now done on every builder-off message, and it was already called several times per request.
+- The builder-off dispatch now reads pipeline state (previously only the builder did) to route `awaiting_repo_choice` / `pr_opened` / `awaiting_promote_target`. The comment on `GITHUB_PLAYGROUND_REPO` was updated: the client-facing flow now also uses playground to hold the small continuity-state file (the PAT needs write access to playground, which it already has).
+
+### Deploy / git state
+
+Deployed to production the same way as prior sessions: the developer ran `vercel --prod` from **PowerShell** (the machine's Bash/Node toolchain is broken — `vercel`/`npx` under `nvm4w` can't find their own modules; PowerShell's toolchain works, consistent with the long-standing "npm via bash is broken" note). Claude's own `vercel --prod` is blocked by the auto-mode classifier (outward-facing deploy), so deploys stay developer-run. This session's `src/bot.ts` changes committed and pushed to `origin/main`. `errors.log` left modified/uncommitted as usual.
+
+### Still outstanding
+
+- **Layer A multi-user** — *still* never live-verified end to end (both accounts reply, a third stays silent). Env var is correct in Vercel; only the actual two-account test remains.
+- Clean demo repos + the client's real deployment handoff (`CLIENT_ONE_PAGER.md`) — unchanged from the prior pick-up list.
