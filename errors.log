@@ -1,0 +1,82 @@
+I can’t physically build it from here, but I can turn “app → real robot” into an engineering plan. The key move: **don’t make the app the robot’s brain.** Keep the app as the UI/teleop/dashboard, and build a robot stack underneath it.
+
+## Target architecture
+
+```
+Phone/Web App
+   │  WiFi / BLE / MQTT / WebSocket
+   ▼
+Robot Brain  (Raspberry Pi / Jetson / mini-PC)
+   │  ROS 2 / custom Linux service
+   ▼
+Real-time Controller  (ESP32 / STM32 / Teensy)
+   │  PWM / CAN / serial
+   ▼
+Motors, servos, sensors, battery, e-stop
+```
+
+The app should send high-level commands like `move forward`, `go to x,y`, `pick up`, or `cmd_vel`. The robot controller handles motor PID, encoders, safety watchdog, and sensor timing.
+
+## Minimum viable “proper” robot
+
+For a mobile robot:
+
+| Part | Recommended |
+|---|---|
+| Brain | Raspberry Pi 4/5 or Jetson Orin Nano |
+| MCU | ESP32 or STM32 |
+| Drive | 2WD differential drive or 4WD mecanum |
+| Motors | 12V gearmotors with encoders |
+| Motor driver | TB6612, VESC, ODrive, or Cytron |
+| Sensors | IMU, wheel encoders, ultrasonic/LiDAR, camera |
+| Power | 3S LiPo / 18650 pack, BMS, DC-DC buck, fuse |
+| Safety | Physical e-stop, current limit, watchdog, kill switch |
+| Comms | WiFi + MQTT/WebSocket, or micro-ROS over serial |
+
+## Build order
+
+1. **Define behavior.** Teleop only? Autonomous navigation? Arm manipulation? Voice? What environment?
+2. **Extract app logic into an API.** Replace fake/simulated commands with a network protocol.
+3. **Bench-test motors.** MCU + driver + one motor. Add encoder feedback and PID.
+4. **Add telemetry.** Battery, pose, speed, errors, connection status back to app.
+5. **Add safety.** E-stop, watchdog, max current, max speed, fail-safe stop.
+6. **Add sensors.** Odometry + IMU first, then LiDAR/camera if needed.
+7. **Move autonomy onto the robot.** Use ROS 2 or a custom Linux service. App becomes dashboard/teleop.
+8. **Enclose and iterate.** Cable management, cooling, mounting, calibration.
+
+## Simple protocol example
+
+App → robot:
+```json
+{"type":"cmd_vel","linear":0.25,"angular":0.0}
+```
+
+Robot → app:
+```json
+{"type":"telemetry","battery":11.8,"left_rpm":120,"right_rpm":118,"status":"ok"}
+```
+
+## Recommended stacks
+
+- **Simple RC/teleop robot:** ESP32 + Arduino/MicroPython + BLE/WiFi + phone app.
+- **Proper autonomous robot:** Raspberry Pi/Jetson + ROS 2 + micro-ROS on ESP32/STM32.
+- **AI robot:** Jetson + ROS 2 + camera + LiDAR + motor controller.
+
+## Safety first
+
+A “proper” robot is not just a moving toy. You need:
+- physical e-stop
+- software watchdog
+- fused battery
+- current limiting
+- speed/acceleration limits
+- emergency stop command from app
+- testing in an empty, safe area
+
+If you tell me:
+1. What the app currently does  
+2. What robot type you want: wheeled, arm, humanoid, drone, etc.  
+3. Your budget and skills  
+4. Platform: Flutter, React Native, web, native  
+
+…I can turn this into a specific BOM, wiring diagram, firmware skeleton, ROS 2 node layout, and app API spec.
