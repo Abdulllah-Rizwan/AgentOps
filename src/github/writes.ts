@@ -4,7 +4,7 @@
 // There is deliberately NO function that writes to a default branch directly and NO auto-merge.
 // Logic (atomic Git Data API commit) preserved from v1/v2.
 
-import { octokit, assertRepoAllowed } from "./client.js";
+import { octokit, assertRepoAllowed, assertRepoDeletable } from "./client.js";
 import { getDefaultBranch } from "./repos.js";
 import { repoKey, type FileChange, type RepoRef } from "../types/index.js";
 
@@ -35,6 +35,18 @@ export async function createRepository(
     isPrivate: data.private,
     defaultBranch: data.default_branch ?? "main",
   };
+}
+
+/**
+ * Delete a repository - the one irreversible action. Gated by its own allow-list via
+ * assertRepoDeletable (NOT the read/write allow-list): a repo must be explicitly listed in
+ * GITHUB_DELETABLE_REPOS, or this refuses before touching GitHub. Requires a PAT with repo-delete
+ * rights (Administration: write). There is intentionally no "force"/"skip-check" path.
+ */
+export async function deleteRepository(repo: RepoRef): Promise<void> {
+  assertRepoDeletable(repo);
+  await octokit.rest.repos.delete({ owner: repo.owner, repo: repo.repo });
+  console.log(`[github] deleted repository ${repoKey(repo)}`);
 }
 
 /** File an issue. Returns the created issue's number and URL. */

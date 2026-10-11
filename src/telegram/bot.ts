@@ -6,6 +6,8 @@
 import { Telegraf } from "telegraf";
 import { config } from "../config/env.js";
 import { handleMessage } from "../agent/conversation.js";
+import { isAddressedToAgent } from "../agent/gate.js";
+import { registerHumanTurn, registerNonHumanTurn } from "../agent/loop-breaker.js";
 import { splitForTelegram, shouldUseMarkdown, toTelegramMarkdown } from "./format.js";
 
 // Telegraf wraps each update in its own timeout and, on firing, its default handler re-throws and
@@ -20,20 +22,51 @@ bot.catch((err, ctx) => {
     .catch((replyErr) => console.error("Couldn't even send the error reply:", replyErr));
 });
 
-// Sender allow-list (CLAUDE_agent_v3.md Section 5). The rejection log wording is kept exact: it's the
-// bootstrap trick for finding a new user's numeric ID (message the bot, read the ID from the logs).
-bot.use((ctx, next) => {
-  const senderId = ctx.from?.id;
-  if (senderId === undefined || !config.telegram.allowedUserIds.has(senderId)) {
-    console.log(`Ignored message from unauthorized user ID: ${senderId}`);
-    return;
-  }
-  return next();
-});
+// NOTE: sender allow-list enforcement used to live in a `bot.use` middleware that dropped every
+// non-allow-listed sender before the handler. It now lives INSIDE the handler (below), so the
+// loop-breaker has a real chokepoint to see and count non-human turns - a blanket drop here would
+// hide them. The security posture is unchanged: unauthorized senders and bots still get silence.
 
 bot.on("text", async (ctx) => {
   const message = ctx.message.text;
   const chatId = ctx.chat.id;
+  const from = ctx.from;
+
+  // Sender classification (CLAUDE.md 3b): a human is an allow-listed, non-bot sender. Anything else
+  // - a bot (is_bot), or any id not on the human allow-list - is treated as non-human.
+  const isAllowedHuman =
+    from !== undefined && from.is_bot !== true && config.telegram.allowedUserIds.has(from.id);
+
+  if (isAllowedHuman) {
+    // A human speaking resets the loop-breaker (addressed or not) - the room has a human again.
+    await registerHumanTurn(chatId);
+  } else {
+    // Kept exact: the bootstrap trick for finding a new user's numeric ID (message the bot, read it here).
+    console.log(`Ignored message from unauthorized/non-human sender ID: ${from?.id} (is_bot=${from?.is_bot === true})`);
+  }
+
+  // Addressing gate (CLAUDE.md 3a): in a group, act only when explicitly @mentioned. The handle is
+  // the configured one, or the bot's own username (Telegraf resolves it via getMe at launch into
+  // ctx.me). Not addressed -> ignore SILENTLY: no placeholder, no LLM call, no reply.
+  const botHandle = config.telegram.agentHandle ?? ctx.me;
+  if (!isAddressedToAgent({ chatType: ctx.chat.type, text: message, botHandle })) {
+    console.log(`[gate] ignoring message in ${ctx.chat.type} chat ${chatId} (not addressed to @${botHandle ?? "?"})`);
+    return;
+  }
+
+  // Command authority is humans-only in v1 (CLAUDE.md 3c): a non-human that addresses the agent is
+  // not obeyed. The loop-breaker counts the turn and, once past the cap, keeps the chat silent until
+  // a human speaks - the backstop against two agents looping even if the gate above ever misfires.
+  if (!isAllowedHuman) {
+    const { count, max, tripped } = await registerNonHumanTurn(chatId);
+    console.log(
+      tripped
+        ? `[loop-breaker] cap ${max} exceeded in chat ${chatId} (turn ${count}); silent until a human speaks.`
+        : `[loop-breaker] non-human turn ${count}/${max} in chat ${chatId}; not acting (humans-only).`
+    );
+    return;
+  }
+
   const placeholder = await ctx.reply("Thinking...");
 
   let resultText: string;

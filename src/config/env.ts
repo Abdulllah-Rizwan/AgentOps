@@ -34,6 +34,20 @@ function optional(name: string): string | undefined {
 /** LLM_MODEL is swappable by config alone (Layer A). Falls back to the model v1/v2 ran on. */
 const DEFAULT_LLM_MODEL = "deepseek-v4-flash";
 
+/** Loop-breaker default if MAX_CONSECUTIVE_BOT_TURNS is unset (CLAUDE.md Section 3b: "start at 3"). */
+const DEFAULT_MAX_BOT_TURNS = 3;
+
+/** Parse a positive-integer env var, falling back to `fallback` when unset. Rejects junk loudly. */
+function parsePositiveInt(name: string, fallback: number): number {
+  const raw = optional(name);
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`${name} must be a positive integer (got "${raw}").`);
+  }
+  return n;
+}
+
 function parseRepoRef(full: string, sourceName: string): RepoRef {
   const [owner, repo] = full.split("/");
   if (!owner || !repo) {
@@ -83,6 +97,13 @@ export interface AppConfig {
     allowedUserIds: Set<number>;
     /** Only needed by the Vercel webhook entry; undefined for local polling. */
     webhookSecret: string | undefined;
+    /**
+     * The agent's own @handle, used by the addressing gate in group chats. Optional: if unset, it is
+     * resolved once from Telegram's getMe at startup. Stored WITHOUT a leading '@' (normalized).
+     */
+    agentHandle: string | undefined;
+    /** Loop-breaker cap: max consecutive non-human turns before the agent goes silent (Section 3b). */
+    maxConsecutiveBotTurns: number;
   };
   llm: {
     apiKey: string;
@@ -96,10 +117,19 @@ export interface AppConfig {
     playgroundRepo: RepoRef;
     /** Named allow-list of repos the agent may open PRs/issues into. Never org-wide. */
     targetRepos: RepoRef[];
+    /**
+     * SEPARATE, narrower allow-list for the one irreversible action: deleting a repo. Kept distinct
+     * from `targetRepos` on purpose - being willing to receive a PR into a repo is not the same as
+     * being willing to have it destroyed. Empty/unset -> every delete is refused (the safe default).
+     */
+    deletableRepos: RepoRef[];
   };
   memory: {
-    // Upstash Redis REST credentials (Layer D). Both absent -> the in-memory fallback is used
-    // (fine for local dev, but does NOT persist across serverless cold starts).
+    // Standard Redis URL (Phase 4 migration). When set, a local/VPS Redis is used via ioredis.
+    // Takes precedence over Upstash so the migration is a config change, not a code change.
+    redisUrl: string | undefined;
+    // Upstash Redis REST credentials (Layer D). Used when redisUrl is unset. Both absent AND no
+    // redisUrl -> the in-memory fallback (fine for local dev, does NOT persist across restarts).
     upstashUrl: string | undefined;
     upstashToken: string | undefined;
   };
@@ -118,6 +148,8 @@ function buildConfig(): AppConfig {
       botToken: required("TELEGRAM_BOT_TOKEN"),
       allowedUserIds: parseUserIds("ALLOWED_TELEGRAM_USER_IDS"),
       webhookSecret: optional("TELEGRAM_WEBHOOK_SECRET"),
+      agentHandle: optional("AGENT_TELEGRAM_HANDLE")?.replace(/^@/, "").toLowerCase(),
+      maxConsecutiveBotTurns: parsePositiveInt("MAX_CONSECUTIVE_BOT_TURNS", DEFAULT_MAX_BOT_TURNS),
     },
     llm: {
       apiKey: required("DEEPSEEK_API_KEY"),
@@ -128,8 +160,10 @@ function buildConfig(): AppConfig {
       pat: required("GITHUB_PAT"),
       playgroundRepo: parseRepoRef(playgroundRaw, "GITHUB_PLAYGROUND_REPO"),
       targetRepos,
+      deletableRepos: parseRepoList("GITHUB_DELETABLE_REPOS"),
     },
     memory: {
+      redisUrl: optional("REDIS_URL"),
       upstashUrl: optional("UPSTASH_REDIS_REST_URL"),
       upstashToken: optional("UPSTASH_REDIS_REST_TOKEN"),
     },

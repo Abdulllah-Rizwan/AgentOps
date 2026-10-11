@@ -33,17 +33,24 @@ console.log(`  playground : ${repoKey(config.github.playgroundRepo)}`);
 console.log(
   `  targets    : ${
     config.github.targetRepos.length ? config.github.targetRepos.map(repoKey).join(", ") : "(none configured yet)"
+  }`
+);
+console.log(
+  `  deletable  : ${
+    config.github.deletableRepos.length
+      ? config.github.deletableRepos.map(repoKey).join(", ")
+      : "(none - every delete is refused)"
   }\n`
 );
 
 console.log("Memory:");
-console.log(
-  `  Upstash Redis: ${
-    config.memory.upstashUrl && config.memory.upstashToken
-      ? "configured (persistent)"
-      : "not set (in-memory fallback; won't persist across cold starts)"
-  }\n`
-);
+const mem = config.memory;
+const memBackend = mem.redisUrl
+  ? `Redis via ioredis (${mem.redisUrl})`
+  : mem.upstashUrl && mem.upstashToken
+    ? "Upstash Redis (REST)"
+    : "in-memory fallback (won't persist across restarts)";
+console.log(`  backend: ${memBackend}\n`);
 
 console.log("Prompts (from prompts.txt):");
 for (const [key, text] of Object.entries(prompts)) {

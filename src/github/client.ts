@@ -66,3 +66,41 @@ export function resolveAllowedRepo(name: string): RepoRef | null {
     allowedRepoList.find((r) => repoKey(r).toLowerCase() === n || r.repo.toLowerCase() === n) ?? null
   );
 }
+
+// --- the separate, narrower gate for the one irreversible action: deletion -------
+//
+// Deleting a repo is not undoable, so it has its OWN allow-list (GITHUB_DELETABLE_REPOS), distinct
+// from the read/write allow-list above. A repo must be named here EXPLICITLY to be deletable; an
+// empty list means nothing is deletable. These must be FULL "owner/repo" entries - deletion never
+// matches on a bare repo name, so a loosely-typed name can't resolve onto the wrong account's repo.
+
+const deletableRepoKeys = new Set(config.github.deletableRepos.map((r) => repoKey(r).toLowerCase()));
+
+/** The list of repos the agent is allowed to DELETE, for messages and prompts. */
+export function deletableRepos(): string[] {
+  return config.github.deletableRepos.map(repoKey);
+}
+
+/**
+ * Gate the irreversible delete behind its own allow-list. The delete path MUST call this first, so
+ * a repo that is not explicitly listed for deletion is refused before any GitHub call is made.
+ */
+export function assertRepoDeletable(repo: RepoRef): void {
+  if (!deletableRepoKeys.has(repoKey(repo).toLowerCase())) {
+    const list = deletableRepos();
+    throw new Error(
+      `Refusing to delete "${repoKey(repo)}" - it is not on the deletable-repo list ` +
+        `(${list.length > 0 ? list.join(", ") : "empty: no repositories may be deleted"}).`
+    );
+  }
+}
+
+/**
+ * Resolve a FULL "owner/repo" name the model produced to a deletable RepoRef, or null if it isn't
+ * on the delete list. Unlike resolveAllowedRepo, this requires the full owner/repo (no bare-name
+ * matching) - the extra friction is deliberate for an irreversible action. Case-insensitive.
+ */
+export function resolveDeletableRepo(name: string): RepoRef | null {
+  const n = name.trim().toLowerCase();
+  return config.github.deletableRepos.find((r) => repoKey(r).toLowerCase() === n) ?? null;
+}
