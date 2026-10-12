@@ -67,6 +67,19 @@ function parseRepoList(name: string): RepoRef[] {
     .map((full) => parseRepoRef(full, name));
 }
 
+/** Parse comma-separated numeric Telegram IDs into a Set. Non-numeric entries are rejected loudly. */
+function parseIdList(name: string, raw: string): Set<number> {
+  const ids = new Set<number>();
+  for (const part of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+    const n = Number(part);
+    if (!Number.isInteger(n)) {
+      throw new Error(`${name} contains a non-numeric Telegram ID: "${part}". Use comma-separated numbers.`);
+    }
+    ids.add(n);
+  }
+  return ids;
+}
+
 /** Comma-separated numeric Telegram IDs -> Set<number>. Non-numeric entries are rejected loudly. */
 function parseUserIds(name: string): Set<number> {
   // Allowed to be empty at first-run (the bootstrap trick: message the bot, read the rejected ID
@@ -78,15 +91,16 @@ function parseUserIds(name: string): Set<number> {
         `it, and your rejected user ID will be logged so you can add it.`
     );
   }
-  const ids = new Set<number>();
-  for (const part of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
-    const n = Number(part);
-    if (!Number.isInteger(n)) {
-      throw new Error(`${name} contains a non-numeric Telegram ID: "${part}". Use comma-separated numbers.`);
-    }
-    ids.add(n);
-  }
-  return ids;
+  return parseIdList(name, raw);
+}
+
+/**
+ * Like parseUserIds but fully OPTIONAL: an unset var yields an empty set (the feature is simply
+ * off). Used for the trusted-peer-agent allow-list, which most deployments won't set.
+ */
+function parseOptionalUserIds(name: string): Set<number> {
+  const raw = process.env[name];
+  return raw === undefined ? new Set<number>() : parseIdList(name, raw);
 }
 
 // --- the shape every other module consumes --------------------------------------
@@ -104,6 +118,15 @@ export interface AppConfig {
     agentHandle: string | undefined;
     /** Loop-breaker cap: max consecutive non-human turns before the agent goes silent (Section 3b). */
     maxConsecutiveBotTurns: number;
+    /**
+     * Peer agents (e.g. Hermes) the client has EXPLICITLY authorized to command this agent in the
+     * shared room (CLAUDE.md 3c), listed by their numeric Telegram sender ID. A message from one of
+     * these that @mentions this agent is obeyed like a human's - but it is still a NON-HUMAN turn for
+     * the loop-breaker (does not reset the counter; counts toward the cap), and every tool still
+     * re-validates the repo against the allow-lists, so command authority never widens repo
+     * authority. Empty/unset -> humans-only (the safe v1 default).
+     */
+    trustedAgentIds: Set<number>;
   };
   llm: {
     apiKey: string;
@@ -150,6 +173,7 @@ function buildConfig(): AppConfig {
       webhookSecret: optional("TELEGRAM_WEBHOOK_SECRET"),
       agentHandle: optional("AGENT_TELEGRAM_HANDLE")?.replace(/^@/, "").toLowerCase(),
       maxConsecutiveBotTurns: parsePositiveInt("MAX_CONSECUTIVE_BOT_TURNS", DEFAULT_MAX_BOT_TURNS),
+      trustedAgentIds: parseOptionalUserIds("TRUSTED_AGENT_TELEGRAM_IDS"),
     },
     llm: {
       apiKey: required("DEEPSEEK_API_KEY"),

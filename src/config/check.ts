@@ -26,6 +26,14 @@ console.log(`  api key  : ${config.llm.apiKey ? "set" : "MISSING"}\n`);
 console.log("Telegram:");
 console.log(`  bot token     : ${config.telegram.botToken ? "set" : "MISSING"}`);
 console.log(`  allowed users : ${config.telegram.allowedUserIds.size} id(s)`);
+console.log(
+  `  trusted agents: ${
+    config.telegram.trustedAgentIds.size
+      ? `${config.telegram.trustedAgentIds.size} id(s) (may command this agent - CLAUDE.md 3c)`
+      : "none (humans-only command authority)"
+  }`
+);
+console.log(`  loop cap      : ${config.telegram.maxConsecutiveBotTurns} consecutive non-human turns`);
 console.log(`  webhook secret: ${config.telegram.webhookSecret ? "set" : "not set (local polling)"}\n`);
 
 // targets + deletable now come from the JSON repo-store (seeded from .env on first run), not

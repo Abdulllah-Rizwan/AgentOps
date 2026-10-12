@@ -37,12 +37,21 @@ bot.on("text", async (ctx) => {
   const isAllowedHuman =
     from !== undefined && from.is_bot !== true && config.telegram.allowedUserIds.has(from.id);
 
+  // A peer agent the client has EXPLICITLY authorized to command this agent (CLAUDE.md 3c, e.g.
+  // Hermes). It is still a NON-HUMAN turn for the loop-breaker below; this grants command authority
+  // only - every tool still re-validates the repo, so it never widens what the agent may touch.
+  const isTrustedAgent = from !== undefined && config.telegram.trustedAgentIds.has(from.id);
+
   if (isAllowedHuman) {
     // A human speaking resets the loop-breaker (addressed or not) - the room has a human again.
     await registerHumanTurn(chatId);
   } else {
-    // Kept exact: the bootstrap trick for finding a new user's numeric ID (message the bot, read it here).
-    console.log(`Ignored message from unauthorized/non-human sender ID: ${from?.id} (is_bot=${from?.is_bot === true})`);
+    // Log the sender id (the bootstrap trick for discovering a human's OR a peer agent's numeric ID:
+    // message the bot, read it here, then add it to the right allow-list). The gate and loop-breaker
+    // below decide whether this turn is acted on.
+    console.log(
+      `[sender] non-human/unlisted sender ID: ${from?.id} (is_bot=${from?.is_bot === true}, trustedAgent=${isTrustedAgent})`
+    );
   }
 
   // Addressing gate (CLAUDE.md 3a): in a group, act only when explicitly @mentioned. The handle is
@@ -54,17 +63,25 @@ bot.on("text", async (ctx) => {
     return;
   }
 
-  // Command authority is humans-only in v1 (CLAUDE.md 3c): a non-human that addresses the agent is
-  // not obeyed. The loop-breaker counts the turn and, once past the cap, keeps the chat silent until
-  // a human speaks - the backstop against two agents looping even if the gate above ever misfires.
+  // Command authority (CLAUDE.md 3c): allow-listed humans always; plus peer agents the client has
+  // explicitly authorized via TRUSTED_AGENT_TELEGRAM_IDS (e.g. Hermes), so the two agents can
+  // collaborate. A non-human turn ALWAYS counts toward the loop-breaker - that is the backstop
+  // against two agents looping forever, and it survives even a trusted exchange: past the cap the
+  // chat stays silent until a human speaks. An addressed non-human that is NOT trusted is never
+  // obeyed.
   if (!isAllowedHuman) {
     const { count, max, tripped } = await registerNonHumanTurn(chatId);
-    console.log(
-      tripped
-        ? `[loop-breaker] cap ${max} exceeded in chat ${chatId} (turn ${count}); silent until a human speaks.`
-        : `[loop-breaker] non-human turn ${count}/${max} in chat ${chatId}; not acting (humans-only).`
-    );
-    return;
+    if (tripped) {
+      console.log(`[loop-breaker] cap ${max} exceeded in chat ${chatId} (turn ${count}); silent until a human speaks.`);
+      return;
+    }
+    if (!isTrustedAgent) {
+      console.log(
+        `[loop-breaker] non-human turn ${count}/${max} in chat ${chatId}; not acting (sender is not an authorized human or trusted agent).`
+      );
+      return;
+    }
+    console.log(`[loop-breaker] trusted agent turn ${count}/${max} in chat ${chatId}; acting on its request.`);
   }
 
   const placeholder = await ctx.reply("Thinking...");
