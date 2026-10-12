@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "config:check": "tsx src/config/check.ts",
     "verify:tools": "tsx scripts/verify-tool-calling.ts",
+    "verify:repo-store": "tsx scripts/verify-repo-store.ts",
     "try:agent": "tsx scripts/try-agent.ts",
     "try:memory": "tsx scripts/try-memory.ts"
   },

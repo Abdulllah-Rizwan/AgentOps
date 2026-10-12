@@ -7,6 +7,7 @@
 // before this prints anything - that's the fail-fast behavior working.
 
 import { config } from "./env.js";
+import { getTargetRepos, getDeletableRepos, repoStorePath } from "./repo-store.js";
 import { prompts } from "../agent/prompts/index.js";
 import { repoKey } from "../types/index.js";
 
@@ -27,21 +28,24 @@ console.log(`  bot token     : ${config.telegram.botToken ? "set" : "MISSING"}`)
 console.log(`  allowed users : ${config.telegram.allowedUserIds.size} id(s)`);
 console.log(`  webhook secret: ${config.telegram.webhookSecret ? "set" : "not set (local polling)"}\n`);
 
+// targets + deletable now come from the JSON repo-store (seeded from .env on first run), not
+// straight from the frozen env config - this print is the proof that the migration took.
+const targetRepos = getTargetRepos();
+const deletableReposList = getDeletableRepos();
 console.log("GitHub:");
 console.log(`  PAT        : ${config.github.pat ? "set" : "MISSING"}`);
 console.log(`  playground : ${repoKey(config.github.playgroundRepo)}`);
 console.log(
-  `  targets    : ${
-    config.github.targetRepos.length ? config.github.targetRepos.map(repoKey).join(", ") : "(none configured yet)"
-  }`
+  `  targets    : ${targetRepos.length ? targetRepos.map(repoKey).join(", ") : "(none configured yet)"}`
 );
 console.log(
   `  deletable  : ${
-    config.github.deletableRepos.length
-      ? config.github.deletableRepos.map(repoKey).join(", ")
+    deletableReposList.length
+      ? deletableReposList.map(repoKey).join(", ")
       : "(none - every delete is refused)"
-  }\n`
+  }`
 );
+console.log(`  repo store : ${repoStorePath()}\n`);
 
 console.log("Memory:");
 const mem = config.memory;

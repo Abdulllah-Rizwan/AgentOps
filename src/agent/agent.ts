@@ -24,7 +24,6 @@ const MAX_STEPS = 8;
 
 export class Agent {
   private readonly tools: AgentTool[];
-  private readonly systemPrompt: string;
 
   constructor() {
     this.tools = [
@@ -37,7 +36,13 @@ export class Agent {
       createDeleteRepoTool(),
     ];
 
-    // Inject the concrete allow-lists into the static safety prompt so the model knows its options.
+  }
+
+  // The system prompt is rebuilt PER REQUEST (not frozen at construction) so the injected repo
+  // allow-lists always reflect the current store. If a repo is pruned - e.g. right after the agent
+  // deletes it - the very next turn's prompt no longer lists it, with no restart. The static prompt
+  // text is loaded once at startup; only the live lists are re-read here.
+  private buildSystemPrompt(): string {
     // Both lists are authoritative; every tool independently re-validates the repo the model picks.
     const repoList = allowedRepos()
       .map((r) => `- ${r}`)
@@ -56,11 +61,12 @@ export class Agent {
           deletable.map((r) => `- ${r}`).join("\n")
         : `You may not delete any repository: your deletable list is empty.`;
 
-    this.systemPrompt =
+    return (
       `${prompts.agent_system}\n\n` +
       `Repositories you may work with (use ONLY these; refuse any other):\n${repoList}\n\n` +
       `${deletableBlock}\n\n` +
-      `${prompts.telegram_formatting}`;
+      `${prompts.telegram_formatting}`
+    );
   }
 
   /**
@@ -75,7 +81,7 @@ export class Agent {
       { role: "user", content: userMessage },
     ];
     return runAgentLoop(
-      { client: llm, model: config.llm.model, systemPrompt: this.systemPrompt, tools: this.tools, maxSteps: MAX_STEPS },
+      { client: llm, model: config.llm.model, systemPrompt: this.buildSystemPrompt(), tools: this.tools, maxSteps: MAX_STEPS },
       conversation
     );
   }

@@ -4,6 +4,9 @@ dist/
 errors.log
 .vercel
 
+# Runtime state the agent maintains (mutable repo allow-lists) — deployment-specific, not code
+data/
+
 # Internal build/working docs — kept local, not published to GitHub
 decisions.md
 CLAUDE.md

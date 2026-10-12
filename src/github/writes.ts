@@ -5,6 +5,7 @@
 // Logic (atomic Git Data API commit) preserved from v1/v2.
 
 import { octokit, assertRepoAllowed, assertRepoDeletable } from "./client.js";
+import { removeRepoEverywhere } from "../config/repo-store.js";
 import { getDefaultBranch } from "./repos.js";
 import { repoKey, type FileChange, type RepoRef } from "../types/index.js";
 
@@ -47,6 +48,14 @@ export async function deleteRepository(repo: RepoRef): Promise<void> {
   assertRepoDeletable(repo);
   await octokit.rest.repos.delete({ owner: repo.owner, repo: repo.repo });
   console.log(`[github] deleted repository ${repoKey(repo)}`);
+
+  // The repo no longer exists, so prune it from BOTH allow-lists (and the store file). This runs
+  // ONLY after a successful delete above - a failed delete throws before here and never shrinks the
+  // lists. It only ever removes, never adds, so it cannot widen what the agent may touch. Effect is
+  // live: the next turn's prompt and every allow-list check stop listing this repo, no restart.
+  if (removeRepoEverywhere(repo)) {
+    console.log(`[github] pruned ${repoKey(repo)} from the repo allow-lists`);
+  }
 }
 
 /** File an issue. Returns the created issue's number and URL. */

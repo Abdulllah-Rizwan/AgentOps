@@ -4,6 +4,7 @@
 
 import { Octokit } from "@octokit/rest";
 import { config } from "../config/env.js";
+import { getTargetRepos, getDeletableRepos } from "../config/repo-store.js";
 import { repoKey, type RepoRef } from "../types/index.js";
 
 // Every octokit.rest.* call is small metadata/blob traffic; 30s comfortably catches a stuck
@@ -21,10 +22,14 @@ octokit.hook.before("request", (options) => {
 // The explicit, named set of repositories the agent may touch: the playground plus the target
 // allow-list (CLAUDE_agent_v3.md Section 5). Never org-wide, never a repo the model merely names.
 // Deduped by key, since a repo can legitimately appear as both playground and a target.
-const allowedRepoList: RepoRef[] = (() => {
+//
+// Computed LIVE from the repo-store on every call (not frozen at module load), so a change to the
+// lists - e.g. a repo pruned right after the agent deletes it - takes effect on the next call with
+// no restart. The playground is a fixed .env value; the targets come from the mutable store.
+function currentAllowedRepoList(): RepoRef[] {
   const seen = new Set<string>();
   const list: RepoRef[] = [];
-  for (const repo of [config.github.playgroundRepo, ...config.github.targetRepos]) {
+  for (const repo of [config.github.playgroundRepo, ...getTargetRepos()]) {
     const key = repoKey(repo).toLowerCase();
     if (!seen.has(key)) {
       seen.add(key);
@@ -32,13 +37,11 @@ const allowedRepoList: RepoRef[] = (() => {
     }
   }
   return list;
-})();
+}
 
-const allowedRepoKeys = new Set(allowedRepoList.map((r) => repoKey(r).toLowerCase()));
-
-/** The list of repos the agent is allowed to act on, for messages and prompts. */
+/** The list of repos the agent is allowed to act on, for messages and prompts. Live from the store. */
 export function allowedRepos(): string[] {
-  return allowedRepoList.map(repoKey);
+  return currentAllowedRepoList().map(repoKey);
 }
 
 /**
@@ -48,7 +51,8 @@ export function allowedRepos(): string[] {
  * being safe.").
  */
 export function assertRepoAllowed(repo: RepoRef): void {
-  if (!allowedRepoKeys.has(repoKey(repo).toLowerCase())) {
+  const allowed = new Set(currentAllowedRepoList().map((r) => repoKey(r).toLowerCase()));
+  if (!allowed.has(repoKey(repo).toLowerCase())) {
     throw new Error(
       `Refusing to act on "${repoKey(repo)}" - it is not on the allowed repo list (${allowedRepos().join(", ")}).`
     );
@@ -63,7 +67,8 @@ export function assertRepoAllowed(repo: RepoRef): void {
 export function resolveAllowedRepo(name: string): RepoRef | null {
   const n = name.trim().toLowerCase();
   return (
-    allowedRepoList.find((r) => repoKey(r).toLowerCase() === n || r.repo.toLowerCase() === n) ?? null
+    currentAllowedRepoList().find((r) => repoKey(r).toLowerCase() === n || r.repo.toLowerCase() === n) ??
+    null
   );
 }
 
@@ -74,11 +79,9 @@ export function resolveAllowedRepo(name: string): RepoRef | null {
 // empty list means nothing is deletable. These must be FULL "owner/repo" entries - deletion never
 // matches on a bare repo name, so a loosely-typed name can't resolve onto the wrong account's repo.
 
-const deletableRepoKeys = new Set(config.github.deletableRepos.map((r) => repoKey(r).toLowerCase()));
-
-/** The list of repos the agent is allowed to DELETE, for messages and prompts. */
+/** The list of repos the agent is allowed to DELETE, for messages and prompts. Live from the store. */
 export function deletableRepos(): string[] {
-  return config.github.deletableRepos.map(repoKey);
+  return getDeletableRepos().map(repoKey);
 }
 
 /**
@@ -86,7 +89,8 @@ export function deletableRepos(): string[] {
  * a repo that is not explicitly listed for deletion is refused before any GitHub call is made.
  */
 export function assertRepoDeletable(repo: RepoRef): void {
-  if (!deletableRepoKeys.has(repoKey(repo).toLowerCase())) {
+  const deletable = new Set(getDeletableRepos().map((r) => repoKey(r).toLowerCase()));
+  if (!deletable.has(repoKey(repo).toLowerCase())) {
     const list = deletableRepos();
     throw new Error(
       `Refusing to delete "${repoKey(repo)}" - it is not on the deletable-repo list ` +
@@ -102,5 +106,5 @@ export function assertRepoDeletable(repo: RepoRef): void {
  */
 export function resolveDeletableRepo(name: string): RepoRef | null {
   const n = name.trim().toLowerCase();
-  return config.github.deletableRepos.find((r) => repoKey(r).toLowerCase() === n) ?? null;
+  return getDeletableRepos().find((r) => repoKey(r).toLowerCase() === n) ?? null;
 }
