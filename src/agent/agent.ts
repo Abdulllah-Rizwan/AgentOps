@@ -15,7 +15,7 @@ import { createCreateIssueTool } from "./tools/create-issue.js";
 import { createOpenPrTool } from "./tools/open-pr.js";
 import { createCreateRepoTool } from "./tools/create-repo.js";
 import { createDeleteRepoTool } from "./tools/delete-repo.js";
-import { allowedRepos } from "../github/client.js";
+import { allowedRepos, deletableRepos } from "../github/client.js";
 import type { AgentTool } from "./tools/types.js";
 
 // Bounded so a bad reasoning chain can't run forever (CLAUDE_agent_v3.md Section 5). Enough for a
@@ -37,14 +37,29 @@ export class Agent {
       createDeleteRepoTool(),
     ];
 
-    // Inject the concrete allow-list into the static safety prompt so the model knows its options.
-    // The list is authoritative; every tool independently re-validates the repo the model picks.
+    // Inject the concrete allow-lists into the static safety prompt so the model knows its options.
+    // Both lists are authoritative; every tool independently re-validates the repo the model picks.
     const repoList = allowedRepos()
       .map((r) => `- ${r}`)
       .join("\n");
+
+    // The deletable list is SEPARATE from the read/write list (a repo may be deletable without
+    // being workable, and vice versa). Without this block the model cannot see which repos it may
+    // delete, so it refuses every delete request without ever calling the tool - the guard in the
+    // tool is then never reached. Exact owner/repo spellings are shown so the model copies them
+    // verbatim (the guard requires a full, exact match).
+    const deletable = deletableRepos();
+    const deletableBlock =
+      deletable.length > 0
+        ? `Repositories you may DELETE with delete_repository (IRREVERSIBLE; ONLY these, named as ` +
+          `the exact owner/repo shown; this list is SEPARATE from the one above):\n` +
+          deletable.map((r) => `- ${r}`).join("\n")
+        : `You may not delete any repository: your deletable list is empty.`;
+
     this.systemPrompt =
       `${prompts.agent_system}\n\n` +
       `Repositories you may work with (use ONLY these; refuse any other):\n${repoList}\n\n` +
+      `${deletableBlock}\n\n` +
       `${prompts.telegram_formatting}`;
   }
 
