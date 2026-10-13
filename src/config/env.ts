@@ -37,6 +37,9 @@ const DEFAULT_LLM_MODEL = "deepseek-v4-flash";
 /** Loop-breaker default if MAX_CONSECUTIVE_BOT_TURNS is unset (CLAUDE.md Section 3b: "start at 3"). */
 const DEFAULT_MAX_BOT_TURNS = 3;
 
+/** Default cap on the agent's own concurrently-open PRs per repo if MAX_OPEN_AGENT_PRS is unset. */
+const DEFAULT_MAX_OPEN_AGENT_PRS = 3;
+
 /** Parse a positive-integer env var, falling back to `fallback` when unset. Rejects junk loudly. */
 function parsePositiveInt(name: string, fallback: number): number {
   const raw = optional(name);
@@ -146,6 +149,12 @@ export interface AppConfig {
      * being willing to have it destroyed. Empty/unset -> every delete is refused (the safe default).
      */
     deletableRepos: RepoRef[];
+    /**
+     * Cap on how many of ITS OWN pull requests the agent keeps open in one repo at once ("its own" =
+     * a PR whose head branch starts with `agent/`). At the cap, open_pull_request opens none and
+     * instead returns the links to the existing open PRs. From MAX_OPEN_AGENT_PRS, default 3.
+     */
+    maxOpenAgentPrs: number;
   };
   memory: {
     // Standard Redis URL (Phase 4 migration). When set, a local/VPS Redis is used via ioredis.
@@ -185,6 +194,7 @@ function buildConfig(): AppConfig {
       playgroundRepo: parseRepoRef(playgroundRaw, "GITHUB_PLAYGROUND_REPO"),
       targetRepos,
       deletableRepos: parseRepoList("GITHUB_DELETABLE_REPOS"),
+      maxOpenAgentPrs: parsePositiveInt("MAX_OPEN_AGENT_PRS", DEFAULT_MAX_OPEN_AGENT_PRS),
     },
     memory: {
       redisUrl: optional("REDIS_URL"),

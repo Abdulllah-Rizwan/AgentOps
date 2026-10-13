@@ -4,9 +4,11 @@
 // into the default branch for a human to merge.
 
 import { openPullRequestWithFiles } from "../../github/writes.js";
+import { listOpenAgentPullRequests } from "../../github/repos.js";
 import { resolveAllowedRepo, allowedRepos } from "../../github/client.js";
+import { config } from "../../config/env.js";
 import { isSafeRepoPath } from "../../utils/paths.js";
-import type { FileChange } from "../../types/index.js";
+import { repoKey, type FileChange } from "../../types/index.js";
 import type { AgentTool } from "./types.js";
 
 // Matches the per-request file cap the rest of the system assumes; keeps a single PR reviewable.
@@ -91,6 +93,19 @@ export function createOpenPrTool(): AgentTool {
           return JSON.stringify({ error: `file ${path} has no content` });
         }
         files.push({ path, content });
+      }
+
+      // Cap the agent's own concurrently-open PRs per repo (MAX_OPEN_AGENT_PRS). "Its own" = a PR
+      // whose head branch starts with `agent/`. At the cap we open none and hand back the links to
+      // the existing open PRs, so the user can merge or close one before the agent opens another.
+      const openAgentPrs = await listOpenAgentPullRequests(repo);
+      if (openAgentPrs.length >= config.github.maxOpenAgentPrs) {
+        return JSON.stringify({
+          error:
+            `reached the open-PR limit of ${config.github.maxOpenAgentPrs} in ${repoKey(repo)}. ` +
+            `Merge or close one of the open PRs below before opening another.`,
+          open_prs: openAgentPrs.map((pr) => ({ number: pr.number, title: pr.title, url: pr.url })),
+        });
       }
 
       const pr = await openPullRequestWithFiles(repo, { title, body: body || title, files });

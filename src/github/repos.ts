@@ -155,6 +155,27 @@ export async function listPullRequests(
   }));
 }
 
+// Every PR the agent opens is from a fresh branch named `agent/<timestamp>` (see
+// openPullRequestWithFiles in writes.ts). A PR whose head branch starts with this prefix is "the
+// agent's own" - the basis for capping how many it keeps open at once.
+export const AGENT_BRANCH_PREFIX = "agent/";
+
+/** Pure: keep only the PRs the agent itself opened (head branch under `agent/`). Split out from the
+ *  network call below so the "its own PR" rule is testable without hitting GitHub. */
+export function filterOwnOpenPrs(prs: PullRequestSummary[]): PullRequestSummary[] {
+  return prs.filter((pr) => pr.headBranch.startsWith(AGENT_BRANCH_PREFIX));
+}
+
+/**
+ * The agent's OWN currently-open pull requests in `repo`, used to cap how many it keeps open at
+ * once. Reuses listPullRequests for the open set (newest first, capped at 30 - far more than any
+ * sane cap) and keeps only the agent's own `agent/` branches.
+ */
+export async function listOpenAgentPullRequests(repo: RepoRef): Promise<PullRequestSummary[]> {
+  const open = await listPullRequests(repo, "open", 30);
+  return filterOwnOpenPrs(open);
+}
+
 /**
  * One pull request's metadata plus its changed files with diffs (patches), so the agent can review
  * the actual code change, not just the description. Diffs are capped per file and in total to keep
